@@ -3,11 +3,13 @@
 package client
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/base64"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/simulot/immich-go/app/root"
 	e2eutils "github.com/simulot/immich-go/internal/e2e/e2eUtils"
@@ -115,4 +117,46 @@ func Test_FromGooglePhotos_EditedPair(t *testing.T) {
 			t.Errorf("stack %s has %d assets, want 2", s.ID, len(s.Assets))
 		}
 	}
+	// Re-run the same fixture against the populated library. Bound the whole
+	// test so a resumed-run stall cannot silently hang the validation job.
+	rerunCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	rerun, _ := root.RootImmichGoCommand(rerunCtx)
+	rerun.SetArgs([]string{
+		"upload", "from-google-photos", "--server=" + ImmichURL,
+		"--api-key=" + u1.APIKey, "--admin-api-key=" + adm.APIKey,
+		"--no-ui", "--on-errors=stop", "--manage-burst=Stack", dir,
+	})
+	if err := rerun.ExecuteContext(rerunCtx); err != nil {
+		t.Fatal("rerun failed", err)
+	}
+	after, err := e2eutils.GetAllAssetList(u1.Email, u1.Password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(assets) {
+		t.Fatalf("rerun changed asset count: %d -> %d", len(assets), len(after))
+	}
+	beforeIDs := make(map[string]string)
+	for _, a := range assets {
+		beforeIDs[a.ID] = a.Checksum
+	}
+	for _, a := range after {
+		if checksum, ok := beforeIDs[a.ID]; !ok || checksum != a.Checksum || a.IsTrashed {
+			t.Errorf("rerun changed or trashed asset %s", a.ID)
+		}
+	}
+	afterStacks, err := e2eutils.GetAllStacks(u1.Email, u1.Password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(afterStacks) != pairs {
+		t.Fatalf("rerun stacks = %d, want %d", len(afterStacks), pairs)
+	}
+	for _, s := range afterStacks {
+		if len(s.Assets) != 2 {
+			t.Errorf("rerun stack %s size %d", s.ID, len(s.Assets))
+		}
+	}
+
 }

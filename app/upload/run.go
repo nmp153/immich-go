@@ -314,7 +314,7 @@ func (uc *UpCmd) handleGroup(ctx context.Context, g *assets.Group) error {
 	// Upload assets from the group
 	for _, a := range g.Assets {
 		err := uc.handleAsset(ctx, a, g)
-		errGroup = errors.Join(err)
+		errGroup = errors.Join(errGroup, err)
 	}
 
 	// Manage groups
@@ -324,15 +324,17 @@ func (uc *UpCmd) handleGroup(ctx context.Context, g *assets.Group) error {
 		client := uc.client.Immich.(immich.ImmichStackInterface)
 		ids := stackIDs(g, uc.assetIndex)
 		if len(ids) > 1 {
-			for _, a := range g.Assets {
-				if slices.Contains(ids, uc.assetIndex.replacement(a).ID) {
-					// Record stacking event
-					uc.app.FileProcessor().RecordNonAsset(ctx, a.File, 0, fileevent.ProcessedStacked)
-				}
-			}
 			_, err := client.CreateStack(ctx, ids)
 			if err != nil {
-				uc.app.Log().Error("Can't create stack", "error", err)
+				stackErr := fmt.Errorf("can't create stack for assets %v: %w", ids, err)
+				uc.app.FileProcessor().RecordNonAsset(ctx, g.Assets[0].File, 0, fileevent.ErrorServerError, "error", stackErr)
+				errGroup = errors.Join(errGroup, stackErr)
+			} else {
+				for _, a := range g.Assets {
+					if slices.Contains(ids, uc.assetIndex.replacement(a).ID) {
+						uc.app.FileProcessor().RecordNonAsset(ctx, a.File, 0, fileevent.ProcessedStacked)
+					}
+				}
 			}
 		}
 	}

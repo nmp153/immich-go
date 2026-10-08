@@ -216,3 +216,38 @@ func TestStackIDs_resolvesReplacedIDs(t *testing.T) {
 		t.Errorf("stackIDs must not change the assets' IDs, got %q", g.Assets[0].ID)
 	}
 }
+
+// Deterministic coverage of both processing orders and size relationships.
+func TestKodaEditedPairsAllOrders(t *testing.T) {
+	for _, originalFirst := range []bool{true, false} {
+		for _, originalSize := range []int64{500, 2000} {
+			date := time.Date(2023, 11, 14, 22, 13, 20, 0, time.UTC)
+			original := localAsset("X.jpg", "X.jpg", originalSize, "original", date)
+			edited := localAsset("X-edited.jpg", "X.jpg", 1000, "edited", date)
+			pair := []*assets.Asset{edited, original}
+			if originalFirst {
+				pair = []*assets.Asset{original, edited}
+			}
+			ii := newAssetIndex()
+			for _, a := range pair {
+				advice, err := ii.ShouldUpload(a, &UpCmd{}, pair...)
+				if err != nil || advice.Advice != NotOnServer {
+					t.Fatalf("first=%v size=%d: %v %v", originalFirst, originalSize, advice, err)
+				}
+				a.ID = a.Checksum
+				ii.addLocalAsset(a)
+			}
+			// A fresh index models another run after both versions were saved.
+			rerun := newAssetIndex()
+			for _, a := range pair {
+				rerun.add(serverAsset(a.ID, a.OriginalFileName, int64(a.FileSize), a.Checksum, date), false)
+			}
+			for _, a := range pair {
+				advice, err := rerun.ShouldUpload(a, &UpCmd{}, pair...)
+				if err != nil || advice.Advice != SameOnServer || advice.ServerAsset.ID != a.ID {
+					t.Fatalf("rerun: %v %v", advice, err)
+				}
+			}
+		}
+	}
+}
