@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"errors"
 	"sync"
 
 	"github.com/simulot/immich-go/internal/gen/syncmap"
@@ -83,12 +84,14 @@ func (cc *CollectionCache[T]) GetCollection(key string) (T, []string, bool) {
 	return c.collection, c.Items(), true
 }
 
-func (cc *CollectionCache[T]) Close() {
+func (cc *CollectionCache[T]) Close() error {
+	var err error
 	cc.collections.Range(func(key string, c *Collection[T]) bool {
-		c.close()
+		err = errors.Join(err, c.close())
 		return true
 	})
 	close(cc.chanNewCollection)
+	return err
 }
 
 type Collection[T comparable] struct {
@@ -97,6 +100,7 @@ type Collection[T comparable] struct {
 	newItems     *syncset.Set[string]
 	saveFn       saveFn[T]
 	maxCacheSize int
+	err          error
 }
 
 func newCollection[T comparable](collection T, maxCacheSize int, saveFn saveFn[T], initialIDs []string, newIDs []string) *Collection[T] {
@@ -111,8 +115,9 @@ func newCollection[T comparable](collection T, maxCacheSize int, saveFn saveFn[T
 	return c
 }
 
-func (c *Collection[T]) close() {
-	_, _ = c.saveFn(c.collection, c.newItems.Items())
+func (c *Collection[T]) close() error {
+	_, err := c.saveFn(c.collection, c.newItems.Items())
+	return errors.Join(c.err, err)
 }
 
 func (c *Collection[T]) Items() []string {
@@ -129,8 +134,9 @@ func (c *Collection[T]) addID(id string) bool {
 		added = true
 		c.newItems.Add(id)
 		if c.newItems.Len() >= c.maxCacheSize {
-			// err is ignored because it's logged in the saveFn
-			c.collection, _ = c.saveFn(c.collection, c.newItems.Items())
+			var err error
+			c.collection, err = c.saveFn(c.collection, c.newItems.Items())
+			c.err = errors.Join(c.err, err)
 
 			// a fresh set of assets, even if the save failed, to avoid retrying the same assets
 			c.newItems = syncset.New[string]()

@@ -52,10 +52,31 @@ func (uc *UpCmd) saveTags(ctx context.Context, tag assets.Tag, ids []string) (as
 			uc.app.Log().Error("failed to create tag", "err", err, "tag", tag.Name)
 			return tag, err
 		}
+		if len(r) != 1 || r[0].ID == "" {
+			return tag, fmt.Errorf("tag %q: server did not return a tag ID", tag.Value)
+		}
 		uc.app.Log().Info("created tag", "tag", tag.Value)
 		tag.ID = r[0].ID
 	}
-	_, err := uc.client.Immich.TagAssets(ctx, tag.ID, ids)
+	results, err := uc.client.Immich.TagAssets(ctx, tag.ID, ids)
+	if err == nil {
+		seen := make(map[string]bool, len(results))
+		for _, result := range results {
+			if !slices.Contains(ids, result.ID) || seen[result.ID] {
+				err = errors.Join(err, fmt.Errorf("unexpected or repeated tag result for asset %s", result.ID))
+			}
+			seen[result.ID] = true
+			// A duplicate relation already has the requested tag.
+			if !result.Success && result.Error != "duplicate" {
+				err = errors.Join(err, fmt.Errorf("tag %q asset %s: %s", tag.Value, result.ID, result.Error))
+			}
+		}
+		for _, id := range ids {
+			if !seen[id] {
+				err = errors.Join(err, fmt.Errorf("tag %q: missing result for asset %s", tag.Value, id))
+			}
+		}
+	}
 	if err != nil {
 		uc.app.Log().Error("failed to add assets to tag", "err", err, "tag", tag.Value, "assets", len(ids))
 		return tag, err
@@ -99,13 +120,24 @@ func (uc *UpCmd) finishing(ctx context.Context) error {
 	}
 	defer func() { uc.finished = true }()
 	// do waiting operations
-	uc.albumsCache.Close()
-	uc.tagsCache.Close()
+	var finishErr error
+	if uc.albumsCache != nil {
+		finishErr = errors.Join(finishErr, uc.albumsCache.Close())
+	}
+	if uc.tagsCache != nil {
+		finishErr = errors.Join(finishErr, uc.tagsCache.Close())
+	}
 
 	// Resume immich background jobs if requested
 	if uc.client.PauseImmichBackgroundJobs {
 		if err := uc.resumeJobs(ctx); err != nil {
-			return err
+			finishErr = errors.Join(finishErr, err)
+		}
+	}
+	if finishErr != nil {
+		uc.app.Log().Error("failed to finish album, tag, or job updates", "err", finishErr)
+		if uc.app.FileProcessor() != nil {
+			uc.app.FileProcessor().RecordNonAsset(ctx, fshelper.FSName(nil, "finalization"), 0, fileevent.ErrorServerError, "error", finishErr)
 		}
 	}
 
@@ -120,10 +152,10 @@ func (uc *UpCmd) finishing(ctx context.Context) error {
 		}
 	}
 
-	return nil
+	return finishErr
 }
 
-func (uc *UpCmd) upload(ctx context.Context, adapter adapters.Reader) error {
+func (uc *UpCmd) upload(ctx context.Context, adapter adapters.Reader) (resultErr error) {
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	// Stop immich background jobs if requested
@@ -134,7 +166,7 @@ func (uc *UpCmd) upload(ctx context.Context, adapter adapters.Reader) error {
 			return fmt.Errorf("can't pause immich background jobs: pass an administrator key with the flag --admin-api-key or disable the jobs pausing with the flag --pause-immich-jobs=FALSE\n%w", err)
 		}
 	}
-	defer func() { _ = uc.finishing(ctx) }()
+	defer func() { resultErr = errors.Join(resultErr, uc.finishing(ctx)) }()
 	defer func() {
 		if uc.app.FileProcessor() != nil {
 			fmt.Println(uc.app.FileProcessor().GenerateReport())
@@ -325,7 +357,13 @@ func (uc *UpCmd) handleGroup(ctx context.Context, g *assets.Group) error {
 		client := uc.client.Immich.(immich.ImmichStackInterface)
 		ids := stackIDs(g, uc.assetIndex)
 		if len(ids) > 1 {
-			_, err := client.CreateStack(ctx, ids)
+			create := client.CreateStack
+			if preserver, ok := client.(interface {
+				EnsureStack(context.Context, []string) (string, error)
+			}); ok {
+				create = preserver.EnsureStack
+			}
+			_, err := create(ctx, ids)
 			if err != nil {
 				stackErr := fmt.Errorf("can't create stack for assets %v: %w", ids, err)
 				uc.app.FileProcessor().RecordNonAsset(ctx, g.Assets[0].File, 0, fileevent.ErrorServerError, "error", stackErr)

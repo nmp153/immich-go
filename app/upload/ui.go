@@ -193,14 +193,14 @@ func (uc *UpCmd) runUI(ctx context.Context, app *app.Application) error {
 		processGrp := errgroup.Group{}
 		processGrp.Go(func() error {
 			// Get immich asset
-			err = uc.getImmichAssets(ctx, ui.updateImmichReading)
+			err := uc.getImmichAssets(ctx, ui.updateImmichReading)
 			if err != nil {
 				stopUI(err)
 			}
 			return err
 		})
 		processGrp.Go(func() error {
-			err = uc.getImmichAlbums(ctx)
+			err := uc.getImmichAlbums(ctx)
 			if err != nil {
 				stopUI(err)
 			}
@@ -215,7 +215,7 @@ func (uc *UpCmd) runUI(ctx context.Context, app *app.Application) error {
 		// Wait the end of the preparation: immich assets, albums and first browsing
 		err = processGrp.Wait()
 		if err != nil {
-			return context.Cause(ctx)
+			return errors.Join(err, context.Cause(ctx))
 		}
 		preparationDone.Store(true)
 
@@ -244,12 +244,12 @@ func (uc *UpCmd) runUI(ctx context.Context, app *app.Application) error {
 	// Wait for termination of UI processes
 	err := uiGroup.Wait()
 	if err != nil {
-		err = context.Cause(ctx)
+		err = errors.Join(err, context.Cause(ctx))
 	}
 
 	// Time to leave
 	if messages.Len() > 0 {
-		return (errors.New(messages.String()))
+		return errors.Join(err, errors.New(messages.String()))
 	}
 	return err
 }

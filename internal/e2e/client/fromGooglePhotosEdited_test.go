@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -156,6 +157,26 @@ func Test_FromGooglePhotos_EditedPair(t *testing.T) {
 	for _, s := range afterStacks {
 		if len(s.Assets) != 2 {
 			t.Errorf("rerun stack %s size %d", s.ID, len(s.Assets))
+		}
+		found := false
+		for _, before := range stacks {
+			if before.ID != s.ID {
+				continue
+			}
+			found = true
+			beforeIDs, afterIDs := map[string]bool{}, map[string]bool{}
+			for _, a := range before.Assets {
+				beforeIDs[a.ID] = true
+			}
+			for _, a := range s.Assets {
+				afterIDs[a.ID] = true
+			}
+			if before.PrimaryAssetID != s.PrimaryAssetID || !reflect.DeepEqual(beforeIDs, afterIDs) {
+				t.Errorf("rerun changed cover or membership of stack %s", s.ID)
+			}
+		}
+		if !found {
+			t.Errorf("rerun recreated stack %s", s.ID)
 		}
 	}
 

@@ -75,6 +75,7 @@ func (uc *UpCmd) runNoUI(ctx context.Context, app *app.Application) error {
 	})
 
 	uiGrp.Go(func() error {
+		defer close(stopProgress)
 		processGrp := errgroup.Group{}
 		var groupChan chan *assets.Group
 		var err error
@@ -93,15 +94,12 @@ func (uc *UpCmd) runNoUI(ctx context.Context, app *app.Application) error {
 		processGrp.Go(func() error {
 			// Run Prepare
 			groupChan = uc.adapter.Browse(ctx)
-			return err
+			return nil
 		})
 		err = processGrp.Wait()
 		if err != nil {
-			err := context.Cause(ctx)
-			if err != nil {
-				cancel(err)
-				return err
-			}
+			cancel(err)
+			return errors.Join(err, context.Cause(ctx))
 		}
 		preparationDone.Store(true)
 		err = uc.uploadLoop(ctx, groupChan)
@@ -119,13 +117,12 @@ func (uc *UpCmd) runNoUI(ctx context.Context, app *app.Application) error {
 			cancel(errors.New(messages.String()))
 		}
 		err = errors.Join(err, uc.finishing(ctx))
-		close(stopProgress)
 		return err
 	})
 
 	err := uiGrp.Wait()
 	if err != nil {
-		err = context.Cause(ctx)
+		err = errors.Join(err, context.Cause(ctx))
 	}
 	return err
 }
