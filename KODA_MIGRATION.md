@@ -1,4 +1,4 @@
-# Koda migration build — candidate 1
+# Koda migration build — candidate 2
 
 This is a temporary migration candidate, not an official immich-go release.
 Do not use it for a full library until synthetic and small real-data imports
@@ -20,6 +20,11 @@ fixtures and integration tests.
 
 Additional candidate changes:
 
+- Candidate 2: finishing skips job-resume requests when
+  --pause-immich-jobs=false. Candidate 1 inherited an unconditional resume
+  request that a regular test account would reject. Regression coverage
+  reproduces that rejection, checks that disabled job management sends no
+  requests, and preserves resume after cancellation when management is enabled.
 - CreateStack uses a 90-second context deadline, independent of a longer
   --client-timeout. Earlier parent/client deadlines still apply. The context
   reaches the actual HTTP request and response-body read. This bounds waiting;
@@ -74,6 +79,6 @@ Review test names with go test -tags e2e ./internal/e2e/client -list GooglePhoto
 
 ## Reproducible Apple Silicon build
 
-    CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -tags timetzdata -ldflags '-s -w -X github.com/simulot/immich-go/app.Version=0.32.0-koda.1' -o immich-go-koda .
+    CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -tags timetzdata -ldflags '-s -w -X github.com/simulot/immich-go/app.Version=0.32.0-koda.2' -o immich-go-koda .
 
 The downloaded binary is unsigned and has not been executed on macOS here.
