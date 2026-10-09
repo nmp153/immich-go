@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Run the four race regressions against unpatched upstream service methods.
+"""Run the five race regressions against unpatched upstream service methods.
 
 Restores patched files even on test failure; never writes outside the supplied
-Immich checkout. A failed test suite is expected only for these four regressions.
+Immich checkout. A failed test suite is expected only for these five regressions.
 """
 import json
 from pathlib import Path
@@ -12,6 +12,7 @@ import sys
 root = Path(sys.argv[1]).resolve()
 base = 'db355f79d910bbfc6378117ed10868493c97b922'
 paths = [
+    'server/src/services/asset.service.ts',
     'server/src/services/metadata.service.ts',
     'server/src/services/tag.service.ts',
     'server/src/services/storage-template.service.ts',
@@ -25,7 +26,7 @@ try:
     result = subprocess.run([
         'pnpm', '--filter', 'immich', 'exec', 'vitest', '--config', 'test/vitest.config.mjs',
         'run', 'src/services/metadata-ordering.spec.ts',
-        '-t', 'does not let|keeps tag relation|cannot clear|moves a sidecar',
+        '-t', 'does not let|keeps tag relation|cannot clear|moves a sidecar|copies a sidecar',
         '--reporter=json', '--outputFile=' + str(report),
     ], cwd=root)
 finally:
@@ -36,8 +37,8 @@ if not report.exists():
 summary = json.loads(report.read_text())
 failed = [test['fullName'] for suite in summary['testResults']
           for test in suite['assertionResults'] if test['status'] == 'failed']
-if result.returncode == 0 or len(failed) != 4:
-    raise SystemExit(f'FAIL: expected four reproduced races, found {len(failed)}')
-print('PASS: all four race regressions fail against the unpatched upstream methods:')
+if result.returncode == 0 or len(failed) != 5:
+    raise SystemExit(f'FAIL: expected five reproduced races, found {len(failed)}')
+print('PASS: all five race regressions fail against the unpatched upstream methods:')
 for name in failed:
     print(' -', name)

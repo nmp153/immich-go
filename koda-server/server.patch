@@ -105,7 +105,7 @@ index c4a3b4f..2d50608 100644
    }
  }
 diff --git a/server/src/services/asset.service.ts b/server/src/services/asset.service.ts
-index 83cc7a6..b152765 100644
+index 83cc7a6..3b9c57a 100644
 --- a/server/src/services/asset.service.ts
 +++ b/server/src/services/asset.service.ts
 @@ -128,6 +128,10 @@ export class AssetService extends BaseService {
@@ -119,7 +119,22 @@ index 83cc7a6..b152765 100644
      const {
        ids,
        isFavorite,
-@@ -503,14 +507,13 @@ export class AssetService extends BaseService {
+@@ -180,7 +184,13 @@ export class AssetService extends BaseService {
+     await this.jobRepository.queueAll(ids.map((id) => ({ name: JobName.SidecarWrite, data: { id } })));
+   }
+ 
+-  async copy(
++  async copy(auth: AuthDto, dto: AssetCopyDto) {
++    return this.databaseRepository.withAssetMetadataLock([dto.sourceId, dto.targetId], () =>
++      this.copyLocked(auth, dto),
++    );
++  }
++
++  private async copyLocked(
+     auth: AuthDto,
+     {
+       sourceId,
+@@ -503,14 +513,13 @@ export class AssetService extends BaseService {
      );
  
      if (Object.keys(writes).length > 0) {
@@ -142,14 +157,15 @@ index 83cc7a6..b152765 100644
  
 diff --git a/server/src/services/metadata-ordering.spec.ts b/server/src/services/metadata-ordering.spec.ts
 new file mode 100644
-index 0000000..987a046
+index 0000000..e692a4f
 --- /dev/null
 +++ b/server/src/services/metadata-ordering.spec.ts
-@@ -0,0 +1,237 @@
+@@ -0,0 +1,284 @@
 +/* eslint-disable @typescript-eslint/require-await -- Asynchronous fakes model repository and job contracts. */
 +import { Stats } from 'node:fs';
 +import { setTimeout } from 'node:timers/promises';
 +import { AssetFileType, AssetPathType } from 'src/enum';
++import { AssetService } from 'src/services/asset.service';
 +import { MetadataService } from 'src/services/metadata.service';
 +import { StorageTemplateService } from 'src/services/storage-template.service';
 +import { TagService } from 'src/services/tag.service';
@@ -177,6 +193,7 @@ index 0000000..987a046
 +    const apiDb = { ...mocks.database, withAssetMetadataLock: apiLock.run.bind(apiLock) };
 +    const jobDb = { ...mocks.database, withAssetMetadataLock: jobLock.run.bind(jobLock) };
 +    const api = newTestService(TagService, { ...mocks, database: apiDb } as unknown as ServiceOverrides).sut;
++    const copier = newTestService(AssetService, { ...mocks, database: apiDb } as unknown as ServiceOverrides).sut;
 +    const worker = newTestService(MetadataService, { ...mocks, database: jobDb } as unknown as ServiceOverrides).sut;
 +    const mover = newTestService(StorageTemplateService, {
 +      ...mocks,
@@ -238,7 +255,7 @@ index 0000000..987a046
 +      state.links = tags;
 +      return [];
 +    });
-+    return { api, worker, mover, mocks, asset, state };
++    return { api, copier, worker, mover, mocks, asset, state };
 +  };
 +
 +  it('does not let an old sidecar read erase a tag after a writer unlocks it', async () => {
@@ -363,6 +380,51 @@ index 0000000..987a046
 +    await expect(worker.handleSidecarWrite({ id: asset.id })).rejects.toThrow('disk unavailable');
 +    expect(mocks.asset.unlockProperties).not.toHaveBeenCalled();
 +    expect(state.locked).toEqual(['tags']);
++  });
++
++  it('copies a sidecar created while a replacement was waiting', async () => {
++    const { copier, worker, mocks, asset } = setup();
++    asset.files = [];
++    const target = { ...asset, id: 'replacement', originalPath: '/data/replacement.jpg', files: [] };
++    const writing = deferred();
++    const resume = deferred();
++    mocks.access.asset.checkOwnerAccess.mockResolvedValue(new Set([asset.id, target.id]));
++    mocks.asset.getForCopy.mockImplementation(async (id) => ({ ...(id === asset.id ? asset : target) }));
++    mocks.assetJob.getLockedPropertiesForMetadataExtraction.mockResolvedValue(['description']);
++    mocks.metadata.writeTags.mockImplementation(async () => {
++      writing.resolve();
++      await resume.promise;
++    });
++    mocks.asset.upsertFile.mockImplementation(async (file) => {
++      if (file.assetId === asset.id) {
++        asset.files = [
++          {
++            ...file,
++            id: 'source-sidecar',
++            isEdited: false,
++            isProgressive: false,
++            isTransparent: false,
++            createdAt: new Date(),
++            updatedAt: new Date(),
++            updateId: 'source-sidecar-update',
++          },
++        ];
++      }
++    });
++    const write = worker.handleSidecarWrite({ id: asset.id });
++    await writing.promise;
++    const copy = copier.copy(authStub.admin, {
++      sourceId: asset.id,
++      targetId: target.id,
++      albums: false,
++      sharedLinks: false,
++      stack: false,
++      favorite: false,
++    });
++    await setTimeout(50);
++    resume.resolve();
++    await Promise.all([write, copy]);
++    expect(mocks.storage.copyFile).toHaveBeenCalledWith(`${asset.originalPath}.xmp`, `${target.originalPath}.xmp`);
 +  });
 +
 +  it('releases the still-photo lock before extracting its motion asset', async () => {

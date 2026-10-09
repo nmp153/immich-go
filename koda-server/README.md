@@ -1,7 +1,7 @@
 # Immich 3.2.4 Koda metadata-ordering candidate
 
 This is a server-side candidate for the metadata races reproduced during the
-Koda synthetic Google Photos imports. It keeps Storage Template enabled. The
+Koda synthetic Google Photos imports. It keeps Storage Template enabled.
 The accompanying immich-go client is 0.32.0-koda.4; this directory does not claim the server
 patch is deployed or approved for the full migration.
 
@@ -13,7 +13,7 @@ patch is deployed or approved for the full migration.
 
 - Per-asset PostgreSQL transaction advisory locks shared by API and job workers.
 - Coordination of tag assignment/removal, API metadata changes, sidecar
-  discovery/writes, metadata extraction, and storage-template moves.
+  discovery/writes/copying, metadata extraction, and storage-template moves.
 - Fresh file-path reads after acquiring the storage-move lock.
 - Propagation of sidecar-write and required-sidecar-read errors, so failed I/O
   cannot silently clear metadata protection or import an empty sidecar.
@@ -32,12 +32,12 @@ outages. Original Immich and these modifications are licensed under AGPL-3.0.
 
 ## Validation
 
-Local checks: four concurrency regressions fail against the unpatched upstream
-service methods and pass with the patch. All 2,286 server unit tests pass;
+Local checks: five concurrency regressions fail against the unpatched upstream
+service methods and pass with the patch. All 2,286 original candidate tests passed; the added copy-path regression also passes;
 TypeScript checking, linting of changed files, and the server build pass.
 
 `negative-control.py` restores the original service methods temporarily, requires
-all four targeted regressions to fail, and restores the candidate in `finally`.
+all five targeted regressions to fail, and restores the candidate in `finally`.
 The tests use an in-memory transactional lock backend locally. Setting
 `KODA_TEST_DATABASE_URL` runs the same tests with independent PostgreSQL sessions.
 
