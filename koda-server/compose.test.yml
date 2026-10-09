@@ -1,0 +1,49 @@
+services:
+  server:
+    image: immich-server-koda:3.2.4-koda.1
+    build: .
+    ports:
+      - '127.0.0.1:2284:2283'
+    environment:
+      DB_HOSTNAME: database
+      DB_USERNAME: postgres
+      DB_PASSWORD: koda-isolated-fixture-only
+      DB_DATABASE_NAME: immich
+      REDIS_HOSTNAME: redis
+      TZ: America/New_York
+      IMMICH_VERSION: v3.2.4
+    volumes:
+      - media:/data
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: 'no'
+  redis:
+    image: docker.io/valkey/valkey:9@sha256:70739f85ad2ee01a726a965584a0f94895f01b0c60b3cc8b0aeef11eaa6888cf
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    restart: 'no'
+  database:
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0@sha256:bcf63357191b76a916ae5eb93464d65c07511da41e3bf7a8416db519b40b1c23
+    environment:
+      POSTGRES_PASSWORD: koda-isolated-fixture-only
+      POSTGRES_USER: postgres
+      POSTGRES_DB: immich
+      POSTGRES_INITDB_ARGS: '--data-checksums'
+    volumes:
+      - database:/var/lib/postgresql/data
+    shm_size: 128mb
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d immich']
+      interval: 2s
+      timeout: 2s
+      retries: 60
+    restart: 'no'
+volumes:
+  media:
+  database:

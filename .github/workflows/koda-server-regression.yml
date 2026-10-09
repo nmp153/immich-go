@@ -1,0 +1,74 @@
+name: Koda server metadata regression
+on:
+  push:
+    branches: [koda-google-photos-migration]
+    paths: ['koda-server/**', '.github/workflows/koda-server-regression.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: koda-server-regression
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Prepare pinned Immich source
+        run: |
+          npm install --global pnpm@11.22.0
+          git clone --depth 1 --branch v3.2.4 https://github.com/immich-app/immich.git /tmp/koda-immich
+          test "$(git -C /tmp/koda-immich rev-parse HEAD)" = db355f79d910bbfc6378117ed10868493c97b922
+          git -C /tmp/koda-immich apply "$GITHUB_WORKSPACE/koda-server/server.patch"
+      - name: Install and build dependencies
+        working-directory: /tmp/koda-immich
+        run: |
+          pnpm install --filter immich... --frozen-lockfile --ignore-scripts
+          pnpm --filter @immich/sdk build
+          pnpm install --filter immich... --frozen-lockfile --ignore-scripts --offline
+          pnpm --filter @immich/plugin-sdk build
+          pnpm install --filter immich... --frozen-lockfile --ignore-scripts --offline
+      - name: Start disposable PostgreSQL 14.19 for cross-worker tests
+        run: |
+          docker run -d --name koda-lock-test -p 127.0.0.1:55439:5432 -e POSTGRES_PASSWORD=koda-test-only postgres:14.19
+          for attempt in {1..60}; do
+            if docker exec koda-lock-test pg_isready -U postgres; then exit 0; fi
+            sleep 1
+          done
+          exit 1
+      - name: Verify that unpatched methods reproduce all four races
+        env:
+          KODA_TEST_DATABASE_URL: postgres://postgres:koda-test-only@127.0.0.1:55439/postgres
+        run: python3 koda-server/negative-control.py /tmp/koda-immich
+      - name: Typecheck, regression tests with PostgreSQL, and build
+        working-directory: /tmp/koda-immich
+        env:
+          KODA_TEST_DATABASE_URL: postgres://postgres:koda-test-only@127.0.0.1:55439/postgres
+        run: |
+          pnpm --filter immich exec tsc --noEmit
+          pnpm --filter immich exec vitest --config test/vitest.config.mjs run src/utils/asset-metadata-lock.spec.ts src/services/metadata-ordering.spec.ts src/repositories/metadata.repository.spec.ts src/services/metadata.service.spec.ts src/services/tag.service.spec.ts src/services/asset.service.spec.ts src/services/storage-template.service.spec.ts
+          pnpm --filter immich build
+      - name: Assemble candidate
+        run: |
+          python3 koda-server/package.py /tmp/koda-immich /tmp/koda-server-fix
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -tags timetzdata -ldflags '-s -w -X github.com/simulot/immich-go/app.Version=0.32.0-koda.3' -o /tmp/koda-server-fix/immich-go-koda .
+      - name: Full isolated import verification with Storage Template enabled
+        run: python3 /tmp/koda-server-fix/test-isolated.py --rounds 3
+      - name: Save candidate and evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: koda-server-fix-candidate
+          path: |
+            /tmp/koda-server-fix
+            /tmp/koda-immich/negative-control.json
+          retention-days: 14
