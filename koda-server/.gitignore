@@ -1,0 +1,4 @@
+__pycache__/
+package/
+test-results/
+*.zip

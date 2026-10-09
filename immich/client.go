@@ -19,6 +19,7 @@ Immich API documentation https://documentation.immich.app/docs/api/introduction
 */
 
 type ImmichClient struct {
+	stackTimeout   time.Duration // Stack metadata request limit, independent of uploads
 	client         *http.Client
 	transport      *http.Transport
 	endPoint       string        // Server API url

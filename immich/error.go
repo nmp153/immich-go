@@ -53,6 +53,8 @@ func (e serverErrorV3) lines() []string {
 	return out
 }
 
+func (ce callError) Unwrap() error { return ce.err }
+
 func (ce callError) Is(target error) bool {
 	_, ok := target.(*callError)
 	return ok

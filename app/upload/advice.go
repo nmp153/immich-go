@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math"
 	"path"
+	"regexp"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +18,8 @@ import (
 
 // - - go:generate stringer -type=AdviceCode
 type AdviceCode int
+
+var numberedTakeoutCopy = regexp.MustCompile(`^(.*)\([0-9]+\)(\.[^.]+)$`)
 
 func (a AdviceCode) String() string {
 	switch a {
@@ -64,6 +68,9 @@ type immichIndex struct {
 	// map of SHA1 to assetID
 	byChecksum *syncmap.SyncMap[string, *assets.Asset]
 
+	// map of the ID of a replaced, deleted asset to the asset that replaced it
+	replacedBy *syncmap.SyncMap[string, *assets.Asset]
+
 	assetNumber int64
 }
 
@@ -73,6 +80,7 @@ func newAssetIndex() *immichIndex {
 		byChecksum:      syncmap.New[string, *assets.Asset](),
 		byName:          syncmap.New[string, []string](),
 		uploadsChecksum: syncset.New[string](),
+		replacedBy:      syncmap.New[string, *assets.Asset](),
 	}
 }
 
@@ -157,6 +165,7 @@ func (ii *immichIndex) replaceAsset(newA *assets.Asset, oldA *assets.Asset) *ass
 	ii.lock.Lock()
 	defer ii.lock.Unlock()
 	oldA.Trashed = true
+	ii.replacedBy.Store(oldA.ID, newA)
 	ii.immichAssets.Store(newA.ID, newA)     // Store the new asset
 	ii.byChecksum.Store(newA.Checksum, newA) // Store the new SHA1
 	ii.uploadsChecksum.Add(newA.Checksum)
@@ -166,6 +175,19 @@ func (ii *immichIndex) replaceAsset(newA *assets.Asset, oldA *assets.Asset) *ass
 	l = append(l, newA.ID)
 	ii.byName.Store(filename, l)
 	return newA
+}
+
+// replacement returns the asset that replaced sa, following replacements of replacements, or sa
+// itself when it has not been replaced. A replaced asset has been deleted from the server, so its
+// ID must not be used any more; callers use the replacement in its place.
+func (ii *immichIndex) replacement(sa *assets.Asset) *assets.Asset {
+	for {
+		r, ok := ii.replacedBy.Load(sa.ID)
+		if !ok {
+			return sa
+		}
+		sa = r
+	}
 }
 
 func (ii *immichIndex) isAlreadyProcessed(checksum string) bool {
@@ -250,14 +272,24 @@ func (ii *immichIndex) adviceForceUpload(sa *assets.Asset) *Advice {
 // la - local asset
 // la.File.Name() is the full path to the file as it is on the source
 // la.OriginalFileName is the name of the file as it was on the device before it was uploaded to the server
-
-func (ii *immichIndex) ShouldUpload(la *assets.Asset, upCmd *UpCmd) (*Advice, error) {
+//
+// siblings are the assets of la's group (burst, raw+jpg, edited pair...), la itself possibly among
+// them. They are never taken for a server-side variant of la: a Google-edited "X-edited.jpg" is
+// indexed under the title of its sidecar, "X.jpg", with the same capture date as "X.jpg", and would
+// otherwise be reported as a smaller/bigger version of the original when it is uploaded first
+// (issue #877, #1285).
+func (ii *immichIndex) ShouldUpload(la *assets.Asset, upCmd *UpCmd, siblings ...*assets.Asset) (*Advice, error) {
 	checksum, err := la.GetChecksum()
 	if err != nil {
 		return nil, err
 	}
 
 	if sa, ok := ii.byChecksum.Load(checksum); ok {
+		if r := ii.replacement(sa); r != sa {
+			// same content as an asset that has been replaced by another one: the replacement
+			// stands for it
+			return ii.adviceBetterOnServer(r), nil
+		}
 		if ii.isAlreadyProcessed(checksum) {
 			return ii.adviceAlreadyProcessed(sa), nil
 		}
@@ -265,6 +297,31 @@ func (ii *immichIndex) ShouldUpload(la *assets.Asset, upCmd *UpCmd) (*Advice, er
 	}
 
 	filename := path.Base(la.File.Name())
+	// Replacement history is only in memory. On a later import, Google may
+	// still supply the deleted smaller copy as X(1).jpg, with X.jpg as its title.
+	// Match it only to an explicitly present, larger original in this group
+	// whose bytes already exist on the server. Looking up the shared title alone
+	// could mistake X-edited.jpg for the original and discard a distinct photo.
+	if match := numberedTakeoutCopy.FindStringSubmatch(filename); !upCmd.Overwrite &&
+		match != nil && match[1]+match[2] == la.OriginalFileName && !la.CaptureDate.IsZero() {
+		for _, sibling := range siblings {
+			if sibling == la || path.Base(sibling.File.Name()) != la.OriginalFileName ||
+				sibling.OriginalFileName != la.OriginalFileName || sibling.FileSize <= la.FileSize ||
+				!sibling.CaptureDate.Equal(la.CaptureDate) {
+				continue
+			}
+			digest, err := sibling.GetChecksum()
+			if err != nil {
+				return nil, err
+			}
+			if existing, ok := ii.byChecksum.Load(digest); ok {
+				existing = ii.replacement(existing)
+				if !existing.Trashed && existing.FileSize > la.FileSize && existing.CaptureDate.Equal(la.CaptureDate) {
+					return ii.adviceBetterOnServer(existing), nil
+				}
+			}
+		}
+	}
 
 	// check all files with the same name
 	ids, ok := ii.byName.Load(filename)
@@ -279,6 +336,10 @@ func (ii *immichIndex) ShouldUpload(la *assets.Asset, upCmd *UpCmd) (*Advice, er
 		for _, id := range ids {
 			sa, ok := ii.immichAssets.Load(id)
 			if !ok {
+				continue
+			}
+			sa = ii.replacement(sa)
+			if sa == la || slices.Contains(siblings, sa) {
 				continue
 			}
 

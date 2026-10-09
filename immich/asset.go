@@ -47,8 +47,8 @@ type Asset struct {
 	// owner
 	OwnerID string `json:"ownerId"`
 	// people
-	Resized bool `json:"resized"`
-	// stack
+	Resized   bool            `json:"resized"`
+	Stack     *AssetStack     `json:"stack"`
 	Tags      []TagSimplified `json:"tags"`
 	Thumbhash string          `json:"thumbhash"`
 	Type      string          `json:"type"`
@@ -60,6 +60,13 @@ type Asset struct {
 	Visibility string `json:"visibility"`
 
 	Albums []AlbumSimplified `json:"-"` // Albums that asset belong to, not in the API
+}
+
+// AssetStack is the stack summary returned by the individual asset endpoint.
+type AssetStack struct {
+	ID             string `json:"id"`
+	PrimaryAssetID string `json:"primaryAssetId"`
+	AssetCount     int    `json:"assetCount"`
 }
 
 // NewAssetFromImmich creates an assets.Asset from an immich.Asset.

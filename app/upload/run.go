@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 
@@ -51,10 +52,31 @@ func (uc *UpCmd) saveTags(ctx context.Context, tag assets.Tag, ids []string) (as
 			uc.app.Log().Error("failed to create tag", "err", err, "tag", tag.Name)
 			return tag, err
 		}
+		if len(r) != 1 || r[0].ID == "" {
+			return tag, fmt.Errorf("tag %q: server did not return a tag ID", tag.Value)
+		}
 		uc.app.Log().Info("created tag", "tag", tag.Value)
 		tag.ID = r[0].ID
 	}
-	_, err := uc.client.Immich.TagAssets(ctx, tag.ID, ids)
+	results, err := uc.client.Immich.TagAssets(ctx, tag.ID, ids)
+	if err == nil {
+		seen := make(map[string]bool, len(results))
+		for _, result := range results {
+			if !slices.Contains(ids, result.ID) || seen[result.ID] {
+				err = errors.Join(err, fmt.Errorf("unexpected or repeated tag result for asset %s", result.ID))
+			}
+			seen[result.ID] = true
+			// A duplicate relation already has the requested tag.
+			if !result.Success && result.Error != "duplicate" {
+				err = errors.Join(err, fmt.Errorf("tag %q asset %s: %s", tag.Value, result.ID, result.Error))
+			}
+		}
+		for _, id := range ids {
+			if !seen[id] {
+				err = errors.Join(err, fmt.Errorf("tag %q: missing result for asset %s", tag.Value, id))
+			}
+		}
+	}
 	if err != nil {
 		uc.app.Log().Error("failed to add assets to tag", "err", err, "tag", tag.Value, "assets", len(ids))
 		return tag, err
@@ -98,13 +120,25 @@ func (uc *UpCmd) finishing(ctx context.Context) error {
 	}
 	defer func() { uc.finished = true }()
 	// do waiting operations
-	uc.albumsCache.Close()
-	uc.tagsCache.Close()
+	var finishErr error
+	if uc.albumsCache != nil {
+		finishErr = errors.Join(finishErr, uc.albumsCache.Close())
+	}
+	if uc.tagsCache != nil {
+		finishErr = errors.Join(finishErr, uc.tagsCache.Close())
+	}
 
 	// Resume immich background jobs if requested
-	err := uc.resumeJobs(ctx)
-	if err != nil {
-		return err
+	if uc.client.PauseImmichBackgroundJobs {
+		if err := uc.resumeJobs(ctx); err != nil {
+			finishErr = errors.Join(finishErr, err)
+		}
+	}
+	if finishErr != nil {
+		uc.app.Log().Error("failed to finish album, tag, or job updates", "err", finishErr)
+		if uc.app.FileProcessor() != nil {
+			uc.app.FileProcessor().RecordNonAsset(ctx, fshelper.FSName(nil, "finalization"), 0, fileevent.ErrorServerError, "error", finishErr)
+		}
 	}
 
 	// Generate FileProcessor report
@@ -118,10 +152,10 @@ func (uc *UpCmd) finishing(ctx context.Context) error {
 		}
 	}
 
-	return nil
+	return finishErr
 }
 
-func (uc *UpCmd) upload(ctx context.Context, adapter adapters.Reader) error {
+func (uc *UpCmd) upload(ctx context.Context, adapter adapters.Reader) (resultErr error) {
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	// Stop immich background jobs if requested
@@ -132,7 +166,7 @@ func (uc *UpCmd) upload(ctx context.Context, adapter adapters.Reader) error {
 			return fmt.Errorf("can't pause immich background jobs: pass an administrator key with the flag --admin-api-key or disable the jobs pausing with the flag --pause-immich-jobs=FALSE\n%w", err)
 		}
 	}
-	defer func() { _ = uc.finishing(ctx) }()
+	defer func() { resultErr = errors.Join(resultErr, uc.finishing(ctx)) }()
 	defer func() {
 		if uc.app.FileProcessor() != nil {
 			fmt.Println(uc.app.FileProcessor().GenerateReport())
@@ -312,8 +346,8 @@ func (uc *UpCmd) handleGroup(ctx context.Context, g *assets.Group) error {
 
 	// Upload assets from the group
 	for _, a := range g.Assets {
-		err := uc.handleAsset(ctx, a)
-		errGroup = errors.Join(err)
+		err := uc.handleAsset(ctx, a, g)
+		errGroup = errors.Join(errGroup, err)
 	}
 
 	// Manage groups
@@ -321,18 +355,25 @@ func (uc *UpCmd) handleGroup(ctx context.Context, g *assets.Group) error {
 
 	if len(g.Assets) > 1 && g.Grouping != assets.GroupByNone {
 		client := uc.client.Immich.(immich.ImmichStackInterface)
-		ids := []string{g.Assets[g.CoverIndex].ID}
-		for i, a := range g.Assets {
-			// Record stacking event
-			uc.app.FileProcessor().RecordNonAsset(ctx, g.Assets[i].File, 0, fileevent.ProcessedStacked)
-			if i != g.CoverIndex && a.ID != "" {
-				ids = append(ids, a.ID)
-			}
-		}
+		ids := stackIDs(g, uc.assetIndex)
 		if len(ids) > 1 {
-			_, err := client.CreateStack(ctx, ids)
+			create := client.CreateStack
+			if preserver, ok := client.(interface {
+				EnsureStack(context.Context, []string) (string, error)
+			}); ok {
+				create = preserver.EnsureStack
+			}
+			_, err := create(ctx, ids)
 			if err != nil {
-				uc.app.Log().Error("Can't create stack", "error", err)
+				stackErr := fmt.Errorf("can't create stack for assets %v: %w", ids, err)
+				uc.app.FileProcessor().RecordNonAsset(ctx, g.Assets[0].File, 0, fileevent.ErrorServerError, "error", stackErr)
+				errGroup = errors.Join(errGroup, stackErr)
+			} else {
+				for _, a := range g.Assets {
+					if slices.Contains(ids, uc.assetIndex.replacement(a).ID) {
+						uc.app.FileProcessor().RecordNonAsset(ctx, a.File, 0, fileevent.ProcessedStacked)
+					}
+				}
 			}
 		}
 	}
@@ -340,13 +381,41 @@ func (uc *UpCmd) handleGroup(ctx context.Context, g *assets.Group) error {
 	return errGroup
 }
 
-func (uc *UpCmd) handleAsset(ctx context.Context, a *assets.Asset) error {
+// stackIDs returns the distinct, non-empty server IDs of the group's assets, cover first, each
+// resolved through ii.replacement (an asset matched to a server asset that a later asset of the
+// group replaced is represented by the replacement). An asset that was discarded, or that failed
+// to upload, has no ID and is left out. The same server asset can back several assets of the
+// group (a local duplicate), and must be listed once.
+func stackIDs(g *assets.Group, ii *immichIndex) []string {
+	ids := make([]string, 0, len(g.Assets))
+	add := func(a *assets.Asset) {
+		id := ii.replacement(a).ID
+		if id != "" && !slices.Contains(ids, id) {
+			ids = append(ids, id)
+		}
+	}
+	if g.CoverIndex >= 0 && g.CoverIndex < len(g.Assets) {
+		add(g.Assets[g.CoverIndex])
+	}
+	for _, a := range g.Assets {
+		add(a)
+	}
+	return ids
+}
+
+// handleAsset uploads the asset a, or updates the server's copy of it, as advised by the asset
+// index. g is the group a belongs to; its other assets are never mistaken for server-side variants
+// of a.
+func (uc *UpCmd) handleAsset(ctx context.Context, a *assets.Asset, g *assets.Group) error {
 	defer func() {
 		a.Close() // Close and clean resources linked to the local asset
 	}()
 
-	// var status stri g
-	advice, err := uc.assetIndex.ShouldUpload(a, uc)
+	var siblings []*assets.Asset
+	if g != nil {
+		siblings = g.Assets
+	}
+	advice, err := uc.assetIndex.ShouldUpload(a, uc, siblings...)
 	if err != nil {
 		return err
 	}
@@ -378,6 +447,7 @@ func (uc *UpCmd) handleAsset(ctx context.Context, a *assets.Asset) error {
 		return nil
 
 	case AlreadyProcessed: // SHA1 already processed
+		a.ID = advice.ServerAsset.ID
 		// Record as discarded - duplicate in input
 		uc.app.FileProcessor().RecordNonAsset(ctx, a.File, int64(a.FileSize), fileevent.DiscardedLocalDuplicate)
 		uc.app.FileProcessor().RecordAssetProcessed(ctx, a.File, int64(a.FileSize), fileevent.ProcessedMetadataUpdated)

@@ -1,0 +1,1128 @@
+diff --git a/server/src/repositories/database.repository.ts b/server/src/repositories/database.repository.ts
+index f079822..d923113 100644
+--- a/server/src/repositories/database.repository.ts
++++ b/server/src/repositories/database.repository.ts
+@@ -1,4 +1,4 @@
+-import { schemaDiff, schemaFromCode, schemaFromDatabase } from '@immich/sql-tools';
++import { createPostgres, schemaDiff, schemaFromCode, schemaFromDatabase } from '@immich/sql-tools';
+ import { Injectable } from '@nestjs/common';
+ import AsyncLock from 'async-lock';
+ import { FileMigrationProvider, Kysely, Migrator, sql } from 'kysely';
+@@ -24,6 +24,7 @@ import 'src/schema'; // make sure all schema definitions are imported for schema
+ import { DB } from 'src/schema';
+ import { immich_uuid_v7 } from 'src/schema/functions';
+ import { ExtensionVersion, VectorExtension } from 'src/types';
++import { AssetMetadataLocks } from 'src/utils/asset-metadata-lock';
+ import { vectorIndexQuery } from 'src/utils/database';
+ import z from 'zod';
+ 
+@@ -56,6 +57,7 @@ export const probes: Record<VectorIndex, number> = {
+ @Injectable()
+ export class DatabaseRepository {
+   private readonly asyncLock = new AsyncLock();
++  private assetMetadataLocks?: AssetMetadataLocks;
+ 
+   constructor(
+     @InjectKysely() private db: Kysely<DB>,
+@@ -66,9 +68,17 @@ export class DatabaseRepository {
+   }
+ 
+   async shutdown() {
++    await this.assetMetadataLocks?.close();
+     await this.db.destroy();
+   }
+ 
++  async withAssetMetadataLock<T>(ids: string[], callback: () => Promise<T>): Promise<T> {
++    this.assetMetadataLocks ??= new AssetMetadataLocks(
++      createPostgres({ connection: this.configRepository.getEnv().database.config, maxConnections: 4 }),
++    );
++    return this.assetMetadataLocks.run(ids, callback);
++  }
++
+   getVectorExtension(): Promise<VectorExtension> {
+     return getVectorExtension(this.db);
+   }
+diff --git a/server/src/repositories/metadata.repository.spec.ts b/server/src/repositories/metadata.repository.spec.ts
+new file mode 100644
+index 0000000..46cbbf4
+--- /dev/null
++++ b/server/src/repositories/metadata.repository.spec.ts
+@@ -0,0 +1,28 @@
++import { LoggingRepository } from 'src/repositories/logging.repository';
++import { MetadataRepository } from 'src/repositories/metadata.repository';
++
++describe('metadata I/O failures', () => {
++  const logger = { setContext() {}, warn: vi.fn() } as unknown as LoggingRepository;
++  let sut: MetadataRepository;
++  beforeEach(() => {
++    sut = new MetadataRepository(logger);
++  });
++  afterEach(async () => {
++    await sut.teardown();
++  });
++
++  it('propagates failed writes so the caller cannot unlock unpersisted fields', async () => {
++    vi.spyOn(sut['exiftool'], 'write').mockRejectedValue(new Error('write failed'));
++    await expect(sut.writeTags('/photo.xmp', { TagsList: ['tag'] })).rejects.toThrow('write failed');
++  });
++
++  it('does not treat a failed known-sidecar read as an empty tag list', async () => {
++    vi.spyOn(sut['exiftool'], 'read').mockRejectedValue(new Error('read failed'));
++    await expect(sut.readTags('/photo.xmp', { throwOnError: true })).rejects.toThrow('read failed');
++  });
++
++  it('retains the existing optional-read behavior for media without readable EXIF', async () => {
++    vi.spyOn(sut['exiftool'], 'read').mockRejectedValue(new Error('unsupported EXIF'));
++    await expect(sut.readTags('/photo.raw')).resolves.toEqual({});
++  });
++});
+diff --git a/server/src/repositories/metadata.repository.ts b/server/src/repositories/metadata.repository.ts
+index c4a3b4f..2d50608 100644
+--- a/server/src/repositories/metadata.repository.ts
++++ b/server/src/repositories/metadata.repository.ts
+@@ -120,11 +120,14 @@ export class MetadataRepository {
+     await this.exiftool.end();
+   }
+ 
+-  readTags(path: string): Promise<ImmichTags> {
++  readTags(path: string, { throwOnError = false } = {}): Promise<ImmichTags> {
+     const options: ReadTaskOptions | undefined = mimeTypes.isVideo(path) ? { readArgs: ['-ee'] } : undefined;
+ 
+     return this.exiftool.read(path, options).catch((error) => {
+       this.logger.warn(`Error reading exif data (${path}): ${error}\n${error?.stack}`);
++      if (throwOnError) {
++        throw error;
++      }
+       return {};
+     }) as Promise<ImmichTags>;
+   }
+@@ -142,6 +145,7 @@ export class MetadataRepository {
+       await this.exiftool.write(path, tagsToWrite);
+     } catch (error) {
+       this.logger.warn(`Error writing exif data (${path}): ${error}`);
++      throw error;
+     }
+   }
+ }
+diff --git a/server/src/services/asset.service.ts b/server/src/services/asset.service.ts
+index 83cc7a6..3b9c57a 100644
+--- a/server/src/services/asset.service.ts
++++ b/server/src/services/asset.service.ts
+@@ -128,6 +128,10 @@ export class AssetService extends BaseService {
+   }
+ 
+   async updateAll(auth: AuthDto, dto: AssetBulkUpdateDto): Promise<void> {
++    return this.databaseRepository.withAssetMetadataLock(dto.ids, () => this.updateAllLocked(auth, dto));
++  }
++
++  private async updateAllLocked(auth: AuthDto, dto: AssetBulkUpdateDto): Promise<void> {
+     const {
+       ids,
+       isFavorite,
+@@ -180,7 +184,13 @@ export class AssetService extends BaseService {
+     await this.jobRepository.queueAll(ids.map((id) => ({ name: JobName.SidecarWrite, data: { id } })));
+   }
+ 
+-  async copy(
++  async copy(auth: AuthDto, dto: AssetCopyDto) {
++    return this.databaseRepository.withAssetMetadataLock([dto.sourceId, dto.targetId], () =>
++      this.copyLocked(auth, dto),
++    );
++  }
++
++  private async copyLocked(
+     auth: AuthDto,
+     {
+       sourceId,
+@@ -503,14 +513,13 @@ export class AssetService extends BaseService {
+     );
+ 
+     if (Object.keys(writes).length > 0) {
+-      await this.assetRepository.upsertExif({
+-        exif: updateLockedColumns({
+-          assetId: id,
+-          ...writes,
+-        }),
+-        lockedPropertiesBehavior: 'append',
++      await this.databaseRepository.withAssetMetadataLock([id], async () => {
++        await this.assetRepository.upsertExif({
++          exif: updateLockedColumns({ assetId: id, ...writes }),
++          lockedPropertiesBehavior: 'append',
++        });
++        await this.jobRepository.queue({ name: JobName.SidecarWrite, data: { id } });
+       });
+-      await this.jobRepository.queue({ name: JobName.SidecarWrite, data: { id } });
+     }
+   }
+ 
+diff --git a/server/src/services/metadata-ordering.spec.ts b/server/src/services/metadata-ordering.spec.ts
+new file mode 100644
+index 0000000..e692a4f
+--- /dev/null
++++ b/server/src/services/metadata-ordering.spec.ts
+@@ -0,0 +1,284 @@
++/* eslint-disable @typescript-eslint/require-await -- Asynchronous fakes model repository and job contracts. */
++import { Stats } from 'node:fs';
++import { setTimeout } from 'node:timers/promises';
++import { AssetFileType, AssetPathType } from 'src/enum';
++import { AssetService } from 'src/services/asset.service';
++import { MetadataService } from 'src/services/metadata.service';
++import { StorageTemplateService } from 'src/services/storage-template.service';
++import { TagService } from 'src/services/tag.service';
++import { deferred, lockHarness } from 'test/asset-metadata-lock.helper';
++import { AssetFactory } from 'test/factories/asset.factory';
++import { authStub } from 'test/fixtures/auth.stub';
++import { tagStub } from 'test/fixtures/tag.stub';
++import { getForMetadataExtraction, getForSidecarWrite, getForStorageTemplate } from 'test/mappers';
++import { getMocks, newTestService, ServiceOverrides } from 'test/utils';
++
++// Deterministic versions of the failing sequences in the Koda server trace.
++// Repository mocks model current DB state; the production service methods and
++// cross-worker guard execute unchanged. The same tests can use real PostgreSQL.
++describe('metadata ordering regressions', () => {
++  let harness: ReturnType<typeof lockHarness>;
++  beforeEach(() => (harness = lockHarness()));
++  afterEach(async () => {
++    await harness.close();
++  });
++
++  const setup = () => {
++    const mocks = getMocks();
++    const apiLock = harness.create();
++    const jobLock = harness.create();
++    const apiDb = { ...mocks.database, withAssetMetadataLock: apiLock.run.bind(apiLock) };
++    const jobDb = { ...mocks.database, withAssetMetadataLock: jobLock.run.bind(jobLock) };
++    const api = newTestService(TagService, { ...mocks, database: apiDb } as unknown as ServiceOverrides).sut;
++    const copier = newTestService(AssetService, { ...mocks, database: apiDb } as unknown as ServiceOverrides).sut;
++    const worker = newTestService(MetadataService, { ...mocks, database: jobDb } as unknown as ServiceOverrides).sut;
++    const mover = newTestService(StorageTemplateService, {
++      ...mocks,
++      database: jobDb,
++    } as unknown as ServiceOverrides).sut;
++    const asset = AssetFactory.from().file({ type: AssetFileType.Sidecar, path: '/data/photo.jpg.xmp' }).exif().build();
++    const state = { tags: [] as string[], links: [] as string[], locked: [] as string[], sidecar: [] as string[] };
++    mocks.access.tag.checkOwnerAccess.mockResolvedValue(new Set(['tag-1']));
++    mocks.access.asset.checkOwnerAccess.mockResolvedValue(new Set([asset.id]));
++    mocks.assetJob.getForMetadataExtraction.mockImplementation(async () => getForMetadataExtraction(asset));
++    mocks.assetJob.getForSidecarWriteJob.mockImplementation(async () => {
++      const row = getForSidecarWrite(asset);
++      row.exifInfo.tags = [...state.tags];
++      return row;
++    });
++    mocks.assetJob.getLockedPropertiesForMetadataExtraction.mockImplementation(
++      async () => [...state.locked] as ['tags'],
++    );
++    mocks.metadata.readTags.mockImplementation(async (path) =>
++      path.endsWith('.xmp') ? { TagsList: [...state.sidecar] } : {},
++    );
++    mocks.metadata.writeTags.mockImplementation(async (_path, tags) => {
++      if (tags.TagsList !== undefined) {
++        state.sidecar = (tags.TagsList ?? []) as string[];
++      }
++    });
++    mocks.asset.unlockProperties.mockImplementation(async (_id, fields) => {
++      state.locked = state.locked.filter((field) => !fields.includes(field as 'tags'));
++      return [];
++    });
++    mocks.storage.stat.mockResolvedValue({
++      size: 1234,
++      mtime: new Date(),
++      mtimeMs: Date.now(),
++      birthtimeMs: Date.now(),
++    } as Stats);
++    mocks.tag.getAssetIds.mockImplementation(async () => new Set(state.links.length > 0 ? [asset.id] : []));
++    mocks.tag.addAssetIds.mockImplementation(async () => {
++      state.links = ['tag-1'];
++    });
++    mocks.asset.getForUpdateTags.mockImplementation(async () => ({ tags: state.links.map((value) => ({ value })) }));
++    mocks.asset.upsertExif.mockImplementation(async ({ exif, lockedPropertiesBehavior }) => {
++      if (exif.tags !== undefined && (lockedPropertiesBehavior !== 'skip' || !state.locked.includes('tags'))) {
++        state.tags = [...((exif.tags as string[]) ?? [])];
++      }
++      if (lockedPropertiesBehavior === 'append') {
++        state.locked = [...new Set([...state.locked, ...((exif.lockedProperties as string[]) ?? [])])];
++      }
++    });
++    mocks.asset.getForMetadataExtractionTags.mockImplementation(async () => ({ tags: state.tags }));
++    mocks.tag.upsertValue.mockImplementation(async ({ value }) => ({
++      ...tagStub.tag,
++      id: value,
++      value,
++      updateId: 'tag-update',
++      userId: asset.ownerId,
++    }));
++    mocks.tag.replaceAssetTags.mockImplementation(async (_id, tags) => {
++      state.links = tags;
++      return [];
++    });
++    return { api, copier, worker, mover, mocks, asset, state };
++  };
++
++  it('does not let an old sidecar read erase a tag after a writer unlocks it', async () => {
++    const { worker, mocks, asset, state } = setup();
++    state.tags = state.links = ['tag-1'];
++    state.locked = ['tags'];
++    const read = deferred();
++    const resume = deferred();
++    mocks.metadata.readTags.mockImplementation(async (path) => {
++      if (!path.endsWith('.xmp')) {
++        return {};
++      }
++      const tags = [...state.sidecar];
++      read.resolve();
++      await resume.promise;
++      return { TagsList: tags };
++    });
++    const extraction = worker.handleMetadataExtraction({ id: asset.id });
++    await read.promise;
++    const write = worker.handleSidecarWrite({ id: asset.id });
++    await setTimeout(50);
++    resume.resolve();
++    await Promise.all([extraction, write]);
++    expect(state.tags).toEqual(['tag-1']);
++    expect(state.links).toEqual(['tag-1']);
++    expect(state.sidecar).toEqual(['tag-1']);
++  });
++
++  it('keeps tag relation insertion and EXIF protection together', async () => {
++    const { api, worker, mocks, asset, state } = setup();
++    const inserted = deferred();
++    const resume = deferred();
++    mocks.tag.addAssetIds.mockImplementation(async () => {
++      state.links = ['tag-1'];
++      inserted.resolve();
++      await resume.promise;
++    });
++    const tag = api.addAssets(authStub.admin, 'tag-1', { ids: [asset.id] });
++    await inserted.promise;
++    const extraction = worker.handleMetadataExtraction({ id: asset.id });
++    await setTimeout(50);
++    resume.resolve();
++    await Promise.all([tag, extraction]);
++    expect(state.tags).toEqual(['tag-1']);
++    expect(state.links).toEqual(['tag-1']);
++    await worker.handleSidecarWrite({ id: asset.id });
++    expect(state.sidecar).toEqual(['tag-1']);
++  });
++
++  it('cannot clear a new tag lock using an older writer snapshot', async () => {
++    const { api, worker, mocks, asset, state } = setup();
++    state.locked = ['description'];
++    const snapshot = deferred();
++    const resume = deferred();
++    const originalRead = mocks.assetJob.getForSidecarWriteJob.getMockImplementation()!;
++    mocks.assetJob.getForSidecarWriteJob.mockImplementationOnce(async (id) => {
++      const row = await originalRead(id);
++      snapshot.resolve();
++      await resume.promise;
++      return row;
++    });
++    const write = worker.handleSidecarWrite({ id: asset.id });
++    await snapshot.promise;
++    const tag = api.addAssets(authStub.admin, 'tag-1', { ids: [asset.id] });
++    await setTimeout(50);
++    resume.resolve();
++    await Promise.all([write, tag]);
++    await worker.handleSidecarWrite({ id: asset.id });
++    await worker.handleMetadataExtraction({ id: asset.id });
++    expect(state.tags).toEqual(['tag-1']);
++    expect(state.links).toEqual(['tag-1']);
++    expect(state.sidecar).toEqual(['tag-1']);
++  });
++
++  it('moves a sidecar created while a storage job was waiting', async () => {
++    const { worker, mover, mocks, asset } = setup();
++    asset.files = [];
++    const stale = getForStorageTemplate(asset);
++    const writing = deferred();
++    const resume = deferred();
++    mocks.assetJob.getLockedPropertiesForMetadataExtraction.mockResolvedValue(['description']);
++    mocks.metadata.writeTags.mockImplementation(async () => {
++      writing.resolve();
++      await resume.promise;
++    });
++    mocks.asset.upsertFile.mockImplementation(async (file) => {
++      asset.files = [
++        {
++          ...file,
++          id: 'sidecar',
++          isEdited: false,
++          isProgressive: false,
++          isTransparent: false,
++          createdAt: new Date(),
++          updatedAt: new Date(),
++          updateId: 'sidecar-update',
++        },
++      ];
++    });
++    mocks.assetJob.getForStorageTemplateJob.mockImplementation(async () => getForStorageTemplate(asset));
++    const moved: string[] = [];
++    vi.spyOn(mover['storageCore'], 'moveFile').mockImplementation(async (file) => {
++      moved.push(file.pathType);
++    });
++    vi.spyOn(mover as unknown as { getTemplatePath: () => Promise<string> }, 'getTemplatePath').mockResolvedValue(
++      '/new/photo.jpg',
++    );
++    const write = worker.handleSidecarWrite({ id: asset.id });
++    await writing.promise;
++    const move = mover.moveAsset(stale, { filename: 'photo.jpg', storageLabel: null });
++    await setTimeout(50);
++    resume.resolve();
++    await Promise.all([write, move]);
++    expect(moved).toEqual([AssetPathType.Original, AssetFileType.Sidecar]);
++  });
++
++  it('preserves field protection when a sidecar write fails', async () => {
++    const { worker, mocks, asset, state } = setup();
++    state.tags = ['tag-1'];
++    state.locked = ['tags'];
++    mocks.metadata.writeTags.mockRejectedValue(new Error('disk unavailable'));
++    await expect(worker.handleSidecarWrite({ id: asset.id })).rejects.toThrow('disk unavailable');
++    expect(mocks.asset.unlockProperties).not.toHaveBeenCalled();
++    expect(state.locked).toEqual(['tags']);
++  });
++
++  it('copies a sidecar created while a replacement was waiting', async () => {
++    const { copier, worker, mocks, asset } = setup();
++    asset.files = [];
++    const target = { ...asset, id: 'replacement', originalPath: '/data/replacement.jpg', files: [] };
++    const writing = deferred();
++    const resume = deferred();
++    mocks.access.asset.checkOwnerAccess.mockResolvedValue(new Set([asset.id, target.id]));
++    mocks.asset.getForCopy.mockImplementation(async (id) => ({ ...(id === asset.id ? asset : target) }));
++    mocks.assetJob.getLockedPropertiesForMetadataExtraction.mockResolvedValue(['description']);
++    mocks.metadata.writeTags.mockImplementation(async () => {
++      writing.resolve();
++      await resume.promise;
++    });
++    mocks.asset.upsertFile.mockImplementation(async (file) => {
++      if (file.assetId === asset.id) {
++        asset.files = [
++          {
++            ...file,
++            id: 'source-sidecar',
++            isEdited: false,
++            isProgressive: false,
++            isTransparent: false,
++            createdAt: new Date(),
++            updatedAt: new Date(),
++            updateId: 'source-sidecar-update',
++          },
++        ];
++      }
++    });
++    const write = worker.handleSidecarWrite({ id: asset.id });
++    await writing.promise;
++    const copy = copier.copy(authStub.admin, {
++      sourceId: asset.id,
++      targetId: target.id,
++      albums: false,
++      sharedLinks: false,
++      stack: false,
++      favorite: false,
++    });
++    await setTimeout(50);
++    resume.resolve();
++    await Promise.all([write, copy]);
++    expect(mocks.storage.copyFile).toHaveBeenCalledWith(`${asset.originalPath}.xmp`, `${target.originalPath}.xmp`);
++  });
++
++  it('releases the still-photo lock before extracting its motion asset', async () => {
++    const { worker, mocks, asset } = setup();
++    const seen: string[] = [];
++    vi.spyOn(
++      worker as unknown as { extractMetadata: (data: { id: string }, motion: string[]) => Promise<undefined> },
++      'extractMetadata',
++    ).mockImplementation(async (data: { id: string }, motion: string[]) => {
++      seen.push(data.id);
++      if (data.id === asset.id) {
++        motion.push('motion-child');
++      }
++      return undefined as never;
++    });
++    await worker.handleMetadataExtraction({ id: asset.id });
++    expect(seen).toEqual([asset.id, 'motion-child']);
++    expect(mocks.job.queue).toHaveBeenCalledWith(expect.objectContaining({ data: { id: 'motion-child' } }));
++  });
++});
+diff --git a/server/src/services/metadata.service.ts b/server/src/services/metadata.service.ts
+index 3dd86ec..7b17d19 100644
+--- a/server/src/services/metadata.service.ts
++++ b/server/src/services/metadata.service.ts
+@@ -228,6 +228,21 @@ export class MetadataService extends BaseService {
+ 
+   @OnJob({ name: JobName.AssetExtractMetadata, queue: QueueName.MetadataExtraction })
+   async handleMetadataExtraction(data: JobOf<JobName.AssetExtractMetadata>) {
++    const motionAssets: string[] = [];
++    const extracted = await this.databaseRepository.withAssetMetadataLock([data.id], () =>
++      this.extractMetadata(data, motionAssets),
++    );
++    // Do not hold the still-photo lock while processing another asset.
++    for (const id of motionAssets) {
++      await this.handleMetadataExtraction({ id });
++      await this.jobRepository.queue({ name: JobName.AssetEncodeVideo, data: { id } });
++    }
++    if (extracted) {
++      await this.eventRepository.emit('AssetMetadataExtracted', extracted);
++    }
++  }
++
++  private async extractMetadata(data: JobOf<JobName.AssetExtractMetadata>, motionAssets: string[]) {
+     const [{ metadata, reverseGeocoding }, asset] = await Promise.all([
+       this.getConfig({ withCache: true }),
+       this.assetJobRepository.getForMetadataExtraction(data.id),
+@@ -387,7 +402,7 @@ export class MetadataService extends BaseService {
+     );
+ 
+     if (this.isMotionPhoto(asset, exifTags)) {
+-      tasks.push(() => this.applyMotionPhotos(asset, exifTags, dates, stats));
++      tasks.push(() => this.applyMotionPhotos(asset, exifTags, dates, stats, motionAssets));
+     }
+ 
+     if (isFaceImportEnabled(metadata) && this.hasTaggedFaces(exifTags)) {
+@@ -402,11 +417,7 @@ export class MetadataService extends BaseService {
+ 
+     await this.assetRepository.upsertJobStatus({ assetId: asset.id, metadataExtractedAt: new Date() });
+ 
+-    await this.eventRepository.emit('AssetMetadataExtracted', {
+-      assetId: asset.id,
+-      userId: asset.ownerId,
+-      source: data.source,
+-    });
++    return { assetId: asset.id, userId: asset.ownerId, source: data.source };
+   }
+ 
+   @OnJob({ name: JobName.SidecarQueueAll, queue: QueueName.Sidecar })
+@@ -422,6 +433,10 @@ export class MetadataService extends BaseService {
+ 
+   @OnJob({ name: JobName.SidecarCheck, queue: QueueName.Sidecar })
+   async handleSidecarCheck({ id }: JobOf<JobName.SidecarCheck>): Promise<JobStatus | undefined> {
++    return this.databaseRepository.withAssetMetadataLock([id], () => this.checkSidecar(id));
++  }
++
++  private async checkSidecar(id: string): Promise<JobStatus | undefined> {
+     const asset = await this.assetJobRepository.getForSidecarCheckJob(id);
+     if (!asset) {
+       return;
+@@ -472,8 +487,11 @@ export class MetadataService extends BaseService {
+   }
+ 
+   @OnJob({ name: JobName.SidecarWrite, queue: QueueName.Sidecar })
+-  async handleSidecarWrite(job: JobOf<JobName.SidecarWrite>): Promise<JobStatus> {
+-    const { id } = job;
++  async handleSidecarWrite({ id }: JobOf<JobName.SidecarWrite>): Promise<JobStatus> {
++    return this.databaseRepository.withAssetMetadataLock([id], () => this.writeSidecar(id));
++  }
++
++  private async writeSidecar(id: string): Promise<JobStatus> {
+     const asset = await this.assetJobRepository.getForSidecarWriteJob(id);
+     if (!asset) {
+       return JobStatus.Failed;
+@@ -567,7 +585,7 @@ export class MetadataService extends BaseService {
+ 
+     const [mediaTags, sidecarTags, videoResult] = await Promise.all([
+       this.metadataRepository.readTags(asset.originalPath),
+-      sidecarFile ? this.metadataRepository.readTags(sidecarFile.path) : null,
++      sidecarFile ? this.metadataRepository.readTags(sidecarFile.path, { throwOnError: true }) : null,
+       shouldProbe ? this.getVideoTags(asset.originalPath) : null,
+     ]);
+ 
+@@ -662,7 +680,7 @@ export class MetadataService extends BaseService {
+     return asset.type === AssetType.Image && !!(tags.MotionPhoto || tags.MicroVideo);
+   }
+ 
+-  private async applyMotionPhotos(asset: Asset, tags: ImmichTags, dates: Dates, stats: Stats) {
++  private async applyMotionPhotos(asset: Asset, tags: ImmichTags, dates: Dates, stats: Stats, motionAssets: string[]) {
+     const isMotionPhoto = tags.MotionPhoto;
+     const isMicroVideo = tags.MicroVideo;
+     const videoOffset = tags.MicroVideoOffset;
+@@ -796,8 +814,7 @@ export class MetadataService extends BaseService {
+         await this.storageRepository.createFile(motionAsset.originalPath, video);
+         this.logger.log(`Wrote motion photo video to ${motionAsset.originalPath}`);
+ 
+-        await this.handleMetadataExtraction({ id: motionAsset.id });
+-        await this.jobRepository.queue({ name: JobName.AssetEncodeVideo, data: { id: motionAsset.id } });
++        motionAssets.push(motionAsset.id);
+       }
+ 
+       this.logger.debug(`Finished motion photo video extraction for asset ${asset.id}: ${asset.originalPath}`);
+diff --git a/server/src/services/storage-template.service.spec.ts b/server/src/services/storage-template.service.spec.ts
+index 72d8802..ed55415 100644
+--- a/server/src/services/storage-template.service.spec.ts
++++ b/server/src/services/storage-template.service.spec.ts
+@@ -15,6 +15,12 @@ const stillAsset = AssetFactory.from({ livePhotoVideoId: motionAsset.id }).exif(
+ describe(StorageTemplateService.name, () => {
+   let sut: StorageTemplateService;
+   let mocks: ServiceMocks;
++  let storageAssets: Map<string, ReturnType<typeof getForStorageTemplate>>;
++  const rememberStorageAsset = (asset: Parameters<typeof getForStorageTemplate>[0]) => {
++    const row = getForStorageTemplate(asset);
++    storageAssets.set(row.id, row);
++    return row;
++  };
+ 
+   it('should work', () => {
+     expect(sut).toBeDefined();
+@@ -22,6 +28,8 @@ describe(StorageTemplateService.name, () => {
+ 
+   beforeEach(() => {
+     ({ sut, mocks } = newTestService(StorageTemplateService));
++    storageAssets = new Map();
++    mocks.assetJob.getForStorageTemplateJob.mockImplementation((id) => Promise.resolve(storageAssets.get(id)));
+ 
+     mocks.systemMetadata.get.mockResolvedValue({ storageTemplate: { enabled: true } });
+ 
+@@ -130,8 +138,8 @@ describe(StorageTemplateService.name, () => {
+       const newMotionPicturePath = `/data/library/${motionAsset.ownerId}/2022/2022-06-19/${stillAsset.originalFileName.slice(0, -4)}.mp4`;
+       const newStillPicturePath = `/data/library/${stillAsset.ownerId}/2022/2022-06-19/${stillAsset.originalFileName}`;
+ 
+-      mocks.assetJob.getForStorageTemplateJob.mockResolvedValueOnce(getForStorageTemplate(stillAsset));
+-      mocks.assetJob.getForStorageTemplateJob.mockResolvedValueOnce(getForStorageTemplate(motionAsset));
++      rememberStorageAsset(stillAsset);
++      rememberStorageAsset(motionAsset);
+ 
+       mocks.move.create.mockResolvedValueOnce({
+         id: '123',
+@@ -182,8 +190,8 @@ describe(StorageTemplateService.name, () => {
+       const newMotionPicturePath = `/data/library/${motionAsset.ownerId}/2022/${album.albumName}/${stillAsset.originalFileName.slice(0, -4)}.mp4`;
+       const newStillPicturePath = `/data/library/${stillAsset.ownerId}/2022/${album.albumName}/${stillAsset.originalFileName}`;
+ 
+-      mocks.assetJob.getForStorageTemplateJob.mockResolvedValueOnce(getForStorageTemplate(stillAsset));
+-      mocks.assetJob.getForStorageTemplateJob.mockResolvedValueOnce(getForStorageTemplate(motionAsset));
++      rememberStorageAsset(stillAsset);
++      rememberStorageAsset(motionAsset);
+       mocks.album.getByAssetId.mockResolvedValue([getForAlbum(album)]);
+ 
+       mocks.move.create.mockResolvedValueOnce({
+@@ -222,7 +230,7 @@ describe(StorageTemplateService.name, () => {
+       sut.onConfigInit({ newConfig: config });
+ 
+       mocks.user.get.mockResolvedValue(user);
+-      mocks.assetJob.getForStorageTemplateJob.mockResolvedValueOnce(getForStorageTemplate(asset));
++      rememberStorageAsset(asset);
+       mocks.album.getByAssetId.mockResolvedValueOnce([getForAlbum(album)]);
+ 
+       expect(await sut.handleMigrationSingle({ id: asset.id })).toBe(JobStatus.Success);
+@@ -245,7 +253,7 @@ describe(StorageTemplateService.name, () => {
+       sut.onConfigInit({ newConfig: config });
+ 
+       mocks.user.get.mockResolvedValue(user);
+-      mocks.assetJob.getForStorageTemplateJob.mockResolvedValueOnce(getForStorageTemplate(asset));
++      rememberStorageAsset(asset);
+ 
+       expect(await sut.handleMigrationSingle({ id: asset.id })).toBe(JobStatus.Success);
+ 
+@@ -273,7 +281,7 @@ describe(StorageTemplateService.name, () => {
+       sut.onConfigInit({ newConfig: config });
+ 
+       mocks.user.get.mockResolvedValue(user);
+-      mocks.assetJob.getForStorageTemplateJob.mockResolvedValueOnce(getForStorageTemplate(asset));
++      rememberStorageAsset(asset);
+       mocks.album.getByAssetId.mockResolvedValueOnce([getForAlbum(album)]);
+       mocks.album.getMetadataForIds.mockResolvedValueOnce([
+         {
+@@ -308,7 +316,7 @@ describe(StorageTemplateService.name, () => {
+       sut.onConfigInit({ newConfig: config });
+ 
+       mocks.user.get.mockResolvedValue(user);
+-      mocks.assetJob.getForStorageTemplateJob.mockResolvedValueOnce(getForStorageTemplate(asset));
++      rememberStorageAsset(asset);
+ 
+       expect(await sut.handleMigrationSingle({ id: asset.id })).toBe(JobStatus.Success);
+ 
+@@ -342,8 +350,8 @@ describe(StorageTemplateService.name, () => {
+       sut.onConfigInit({ newConfig: config });
+ 
+       mocks.user.get.mockResolvedValue(user);
+-      mocks.assetJob.getForStorageTemplateJob.mockResolvedValueOnce(getForStorageTemplate(assetBerlin));
+-      mocks.assetJob.getForStorageTemplateJob.mockResolvedValueOnce(getForStorageTemplate(assetLondon));
++      rememberStorageAsset(assetBerlin);
++      rememberStorageAsset(assetLondon);
+ 
+       await expect(sut.handleMigrationSingle({ id: assetBerlin.id })).resolves.toBe(JobStatus.Success);
+       await expect(sut.handleMigrationSingle({ id: assetLondon.id })).resolves.toBe(JobStatus.Success);
+@@ -396,7 +404,7 @@ describe(StorageTemplateService.name, () => {
+         oldPath: asset.originalPath,
+         newPath: previousFailedNewPath,
+       });
+-      mocks.assetJob.getForStorageTemplateJob.mockResolvedValue(getForStorageTemplate(asset));
++      rememberStorageAsset(asset);
+       mocks.move.update.mockResolvedValue({
+         id: '123',
+         entityId: asset.id,
+@@ -445,7 +453,7 @@ describe(StorageTemplateService.name, () => {
+         oldPath: asset.originalPath,
+         newPath: previousFailedNewPath,
+       });
+-      mocks.assetJob.getForStorageTemplateJob.mockResolvedValue(getForStorageTemplate(asset));
++      rememberStorageAsset(asset);
+       mocks.move.update.mockResolvedValue({
+         id: '123',
+         entityId: asset.id,
+@@ -480,7 +488,7 @@ describe(StorageTemplateService.name, () => {
+       mocks.storage.rename.mockRejectedValue({ code: 'EXDEV' });
+       mocks.storage.stat.mockResolvedValue({ size: 5000 } as Stats);
+       mocks.crypto.hashFile.mockResolvedValue(Buffer.from('different-hash', 'utf8'));
+-      mocks.assetJob.getForStorageTemplateJob.mockResolvedValue(getForStorageTemplate(asset));
++      rememberStorageAsset(asset);
+       mocks.move.create.mockResolvedValue({
+         id: '123',
+         entityId: asset.id,
+@@ -530,7 +538,7 @@ describe(StorageTemplateService.name, () => {
+           oldPath: testAsset.originalPath,
+           newPath: previousFailedNewPath,
+         });
+-        mocks.assetJob.getForStorageTemplateJob.mockResolvedValue(getForStorageTemplate(testAsset));
++        rememberStorageAsset(testAsset);
+         mocks.move.update.mockResolvedValue({
+           id: '123',
+           entityId: testAsset.id,
+@@ -573,7 +581,7 @@ describe(StorageTemplateService.name, () => {
+       const newPath = `/data/library/${asset.ownerId}/2022/2022-06-19/${asset.originalFileName}`;
+       const newPath2 = newPath.replace('.jpg', '+1.jpg');
+ 
+-      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([getForStorageTemplate(asset)]));
++      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([rememberStorageAsset(asset)]));
+       mocks.user.getList.mockResolvedValue([userStub.user1]);
+       mocks.move.create.mockResolvedValue({
+         id: '123',
+@@ -601,7 +609,7 @@ describe(StorageTemplateService.name, () => {
+         .exif()
+         .build();
+ 
+-      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([getForStorageTemplate(asset)]));
++      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([rememberStorageAsset(asset)]));
+       mocks.user.getList.mockResolvedValue([userStub.user1]);
+ 
+       await sut.handleMigration();
+@@ -620,7 +628,7 @@ describe(StorageTemplateService.name, () => {
+         .exif()
+         .build();
+ 
+-      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([getForStorageTemplate(asset)]));
++      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([rememberStorageAsset(asset)]));
+       mocks.user.getList.mockResolvedValue([userStub.user1]);
+ 
+       await sut.handleMigration();
+@@ -641,7 +649,7 @@ describe(StorageTemplateService.name, () => {
+ 
+       const oldPath = asset.originalPath;
+       const newPath = `/data/library/${asset.ownerId}/2022/2022-06-19/${asset.originalFileName}`;
+-      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([getForStorageTemplate(asset)]));
++      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([rememberStorageAsset(asset)]));
+       mocks.user.getList.mockResolvedValue([userStub.user1]);
+       mocks.move.create.mockResolvedValue({
+         id: '123',
+@@ -667,7 +675,7 @@ describe(StorageTemplateService.name, () => {
+         .exif()
+         .build();
+ 
+-      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([getForStorageTemplate(asset)]));
++      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([rememberStorageAsset(asset)]));
+       mocks.user.getList.mockResolvedValue([user]);
+       mocks.move.create.mockResolvedValue({
+         id: '123',
+@@ -702,7 +710,7 @@ describe(StorageTemplateService.name, () => {
+ 
+       const oldPath = asset.originalPath;
+       const newPath = `/data/library/${asset.ownerId}/2022/2022-06-19/${asset.originalFileName}`;
+-      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([getForStorageTemplate(asset)]));
++      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([rememberStorageAsset(asset)]));
+       mocks.storage.rename.mockRejectedValue({ code: 'EXDEV' });
+       mocks.user.getList.mockResolvedValue([userStub.user1]);
+       mocks.move.create.mockResolvedValue({
+@@ -748,7 +756,7 @@ describe(StorageTemplateService.name, () => {
+         .exif()
+         .build();
+ 
+-      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([getForStorageTemplate(asset)]));
++      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([rememberStorageAsset(asset)]));
+       mocks.storage.rename.mockRejectedValue({ code: 'EXDEV' });
+       mocks.user.getList.mockResolvedValue([user]);
+       mocks.move.create.mockResolvedValue({
+@@ -788,7 +796,7 @@ describe(StorageTemplateService.name, () => {
+         .exif()
+         .build();
+ 
+-      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([getForStorageTemplate(asset)]));
++      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([rememberStorageAsset(asset)]));
+       mocks.storage.rename.mockRejectedValue(new Error('Read only system'));
+       mocks.storage.copyFile.mockRejectedValue(new Error('Read only system'));
+       mocks.move.create.mockResolvedValue({
+@@ -833,9 +841,9 @@ describe(StorageTemplateService.name, () => {
+       const newMotionPicturePath = `/data/library/${motionAsset.ownerId}/2022/${album.albumName}/${stillAsset.originalFileName.slice(0, -4)}.mp4`;
+       const newStillPicturePath = `/data/library/${stillAsset.ownerId}/2022/${album.albumName}/${stillAsset.originalFileName}`;
+ 
+-      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([getForStorageTemplate(stillAsset)]));
++      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([rememberStorageAsset(stillAsset)]));
+       mocks.user.getList.mockResolvedValue([userStub.user1]);
+-      mocks.assetJob.getForStorageTemplateJob.mockResolvedValueOnce(getForStorageTemplate(motionAsset));
++      rememberStorageAsset(motionAsset);
+       mocks.album.getByAssetId.mockResolvedValue([getForAlbum(album)]);
+ 
+       mocks.move.create.mockResolvedValueOnce({
+@@ -872,9 +880,9 @@ describe(StorageTemplateService.name, () => {
+ 
+       sut.onConfigInit({ newConfig: config });
+ 
+-      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([getForStorageTemplate(stillAsset)]));
++      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([rememberStorageAsset(stillAsset)]));
+       mocks.user.getList.mockResolvedValue([user]);
+-      mocks.assetJob.getForStorageTemplateJob.mockResolvedValueOnce(getForStorageTemplate(motionAsset));
++      rememberStorageAsset(motionAsset);
+       mocks.album.getByAssetId.mockResolvedValue([getForAlbum(album)]);
+ 
+       mocks.move.create.mockResolvedValueOnce({
+@@ -920,7 +928,7 @@ describe(StorageTemplateService.name, () => {
+         .exif()
+         .build();
+ 
+-      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([getForStorageTemplate(asset)]));
++      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([rememberStorageAsset(asset)]));
+       mocks.user.getList.mockResolvedValue([user]);
+       mocks.move.create.mockResolvedValue({
+         id: '123',
+@@ -950,7 +958,7 @@ describe(StorageTemplateService.name, () => {
+         .exif({ fileSizeInByte: 12_345 })
+         .build();
+ 
+-      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([getForStorageTemplate(asset)]));
++      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([rememberStorageAsset(asset)]));
+       mocks.user.getList.mockResolvedValue([user]);
+       mocks.move.create.mockResolvedValue({
+         id: '123',
+@@ -980,7 +988,7 @@ describe(StorageTemplateService.name, () => {
+         .exif()
+         .build();
+ 
+-      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([getForStorageTemplate(asset)]));
++      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([rememberStorageAsset(asset)]));
+       mocks.user.getList.mockResolvedValue([user]);
+       mocks.move.create.mockResolvedValue({
+         id: '123',
+@@ -1010,7 +1018,7 @@ describe(StorageTemplateService.name, () => {
+         .exif()
+         .build();
+ 
+-      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([getForStorageTemplate(asset)]));
++      mocks.assetJob.streamForStorageTemplateJob.mockReturnValue(makeStream([rememberStorageAsset(asset)]));
+       mocks.user.getList.mockResolvedValue([user]);
+       mocks.move.create.mockResolvedValue({
+         id: '123',
+diff --git a/server/src/services/storage-template.service.ts b/server/src/services/storage-template.service.ts
+index c2aaf98..d4079a8 100644
+--- a/server/src/services/storage-template.service.ts
++++ b/server/src/services/storage-template.service.ts
+@@ -219,44 +219,51 @@ export class StorageTemplateService extends BaseService {
+   }
+ 
+   async moveAsset(asset: StorageAsset, metadata: MoveAssetMetadata, stillPhoto?: StorageAsset) {
+-    if (asset.isExternal || StorageCore.isAndroidMotionPath(asset.originalPath)) {
+-      // External assets are not affected by storage template
+-      // TODO: shouldn't this only apply to external assets?
+-      return;
+-    }
+-
+-    return this.databaseRepository.withLock(DatabaseLock.StorageTemplateMigration, async () => {
+-      const { id, originalPath, checksum, fileSizeInByte } = asset;
+-      const oldPath = originalPath;
+-      const newPath = await this.getTemplatePath(asset, metadata, stillPhoto);
+-
+-      if (!fileSizeInByte) {
+-        this.logger.error(`Asset ${id} missing exif info, skipping storage template migration`);
+-        return;
+-      }
++    return this.databaseRepository.withLock(DatabaseLock.StorageTemplateMigration, () =>
++      this.databaseRepository.withAssetMetadataLock(stillPhoto ? [asset.id, stillPhoto.id] : [asset.id], async () => {
++        const fresh = await this.assetJobRepository.getForStorageTemplateJob(asset.id, { includeHidden: true });
++        if (!fresh || fresh.isExternal || StorageCore.isAndroidMotionPath(fresh.originalPath)) {
++          return;
++        }
++        asset = fresh;
++        if (stillPhoto) {
++          stillPhoto = await this.assetJobRepository.getForStorageTemplateJob(stillPhoto.id, { includeHidden: true });
++          if (!stillPhoto) {
++            return;
++          }
++        }
++        const { id, originalPath, checksum, fileSizeInByte } = asset;
++        const oldPath = originalPath;
++        const newPath = await this.getTemplatePath(asset, metadata, stillPhoto);
+ 
+-      try {
+-        await this.storageCore.moveFile({
+-          entityId: id,
+-          pathType: AssetPathType.Original,
+-          oldPath,
+-          newPath,
+-          assetInfo: { sizeInBytes: fileSizeInByte, checksum },
+-        });
++        if (!fileSizeInByte) {
++          this.logger.error(`Asset ${id} missing exif info, skipping storage template migration`);
++          return;
++        }
+ 
+-        const sidecarPath = getAssetFile(asset.files, AssetFileType.Sidecar, { isEdited: false })?.path;
+-        if (sidecarPath) {
++        try {
+           await this.storageCore.moveFile({
+             entityId: id,
+-            pathType: AssetFileType.Sidecar,
+-            oldPath: sidecarPath,
+-            newPath: `${newPath}.xmp`,
++            pathType: AssetPathType.Original,
++            oldPath,
++            newPath,
++            assetInfo: { sizeInBytes: fileSizeInByte, checksum },
+           });
++
++          const sidecarPath = getAssetFile(asset.files, AssetFileType.Sidecar, { isEdited: false })?.path;
++          if (sidecarPath) {
++            await this.storageCore.moveFile({
++              entityId: id,
++              pathType: AssetFileType.Sidecar,
++              oldPath: sidecarPath,
++              newPath: `${newPath}.xmp`,
++            });
++          }
++        } catch (error: any) {
++          this.logger.error(`Problem applying storage template`, error?.stack, { id, oldPath, newPath });
+         }
+-      } catch (error: any) {
+-        this.logger.error(`Problem applying storage template`, error?.stack, { id, oldPath, newPath });
+-      }
+-    });
++      }),
++    );
+   }
+ 
+   private async getTemplatePath(
+diff --git a/server/src/services/tag.service.ts b/server/src/services/tag.service.ts
+index c2285a3..b1b683b 100644
+--- a/server/src/services/tag.service.ts
++++ b/server/src/services/tag.service.ts
+@@ -89,6 +89,10 @@ export class TagService extends BaseService {
+   }
+ 
+   async bulkTagAssets(auth: AuthDto, dto: TagBulkAssetsDto): Promise<TagBulkAssetsResponseDto> {
++    return this.databaseRepository.withAssetMetadataLock(dto.assetIds, () => this.bulkTagAssetsLocked(auth, dto));
++  }
++
++  private async bulkTagAssetsLocked(auth: AuthDto, dto: TagBulkAssetsDto): Promise<TagBulkAssetsResponseDto> {
+     const [tagIds, assetIds] = await Promise.all([
+       this.checkAccess({ auth, permission: Permission.TagAsset, ids: dto.tagIds }),
+       this.checkAccess({ auth, permission: Permission.AssetUpdate, ids: dto.assetIds }),
+@@ -111,6 +115,10 @@ export class TagService extends BaseService {
+   }
+ 
+   async addAssets(auth: AuthDto, id: string, dto: BulkIdsDto): Promise<BulkIdResponseDto[]> {
++    return this.databaseRepository.withAssetMetadataLock(dto.ids, () => this.addAssetsLocked(auth, id, dto));
++  }
++
++  private async addAssetsLocked(auth: AuthDto, id: string, dto: BulkIdsDto): Promise<BulkIdResponseDto[]> {
+     await this.requireAccess({ auth, permission: Permission.TagAsset, ids: [id] });
+ 
+     const results = await addAssets(
+@@ -132,6 +140,10 @@ export class TagService extends BaseService {
+   }
+ 
+   async removeAssets(auth: AuthDto, id: string, dto: BulkIdsDto): Promise<BulkIdResponseDto[]> {
++    return this.databaseRepository.withAssetMetadataLock(dto.ids, () => this.removeAssetsLocked(auth, id, dto));
++  }
++
++  private async removeAssetsLocked(auth: AuthDto, id: string, dto: BulkIdsDto): Promise<BulkIdResponseDto[]> {
+     await this.requireAccess({ auth, permission: Permission.TagAsset, ids: [id] });
+ 
+     const results = await removeAssets(
+diff --git a/server/src/utils/asset-metadata-lock.spec.ts b/server/src/utils/asset-metadata-lock.spec.ts
+new file mode 100644
+index 0000000..4d2e97b
+--- /dev/null
++++ b/server/src/utils/asset-metadata-lock.spec.ts
+@@ -0,0 +1,68 @@
++/* eslint-disable @typescript-eslint/require-await -- Asynchronous fakes model repository and job contracts. */
++import { setTimeout } from 'node:timers/promises';
++import { deferred, lockHarness } from 'test/asset-metadata-lock.helper';
++
++describe('asset metadata coordination across workers', () => {
++  let harness: ReturnType<typeof lockHarness>;
++  beforeEach(() => (harness = lockHarness()));
++  afterEach(async () => {
++    await harness.close();
++  });
++
++  it('serializes the same asset but lets a different asset finish', async () => {
++    const api = harness.create();
++    const worker = harness.create();
++    const entered = deferred();
++    const finish = deferred();
++    const events: string[] = [];
++    const first = api.run(['photo'], async () => {
++      events.push('first');
++      entered.resolve();
++      await finish.promise;
++    });
++    await entered.promise;
++    const second = worker.run(['photo'], async () => {
++      events.push('second');
++    });
++    await worker.run(['other-photo'], async () => {
++      events.push('other');
++    });
++    const during = [...events];
++    finish.resolve();
++    await Promise.all([first, second]);
++    expect(during).toEqual(['first', 'other']);
++    expect(events).toEqual(['first', 'other', 'second']);
++  });
++
++  it('sorts overlapping batches so inverse caller order cannot deadlock', async () => {
++    const a = harness.create();
++    const b = harness.create();
++    let active = 0;
++    let maxActive = 0;
++    const critical = async () => {
++      maxActive = Math.max(maxActive, ++active);
++      await setTimeout(10);
++      active--;
++    };
++    await Promise.all([a.run(['b', 'a', 'b'], critical), b.run(['a', 'b'], critical)]);
++    expect(maxActive).toBe(1);
++  });
++
++  it('releases database locks after an exception', async () => {
++    const a = harness.create();
++    const b = harness.create();
++    await expect(
++      a.run(['photo'], async () => {
++        throw new Error('disk failed');
++      }),
++    ).rejects.toThrow('disk failed');
++    await expect(b.run(['photo'], async () => 'recovered')).resolves.toBe('recovered');
++  });
++
++  it('allows a nested subset and rejects acquiring an unrelated child asset', async () => {
++    const a = harness.create();
++    await expect(a.run(['PHOTO', 'other'], () => a.run(['photo'], async () => 'ok'))).resolves.toBe('ok');
++    await expect(a.run(['photo'], () => a.run(['motion'], async () => 'bad'))).rejects.toThrow('Nested metadata locks');
++    await expect(a.run(['motion'], async () => 'released')).resolves.toBe('released');
++  });
++});
+diff --git a/server/src/utils/asset-metadata-lock.ts b/server/src/utils/asset-metadata-lock.ts
+new file mode 100644
+index 0000000..bd3ce64
+--- /dev/null
++++ b/server/src/utils/asset-metadata-lock.ts
+@@ -0,0 +1,48 @@
++import AsyncLock from 'async-lock';
++import { AsyncLocalStorage } from 'node:async_hooks';
++import { Sql } from 'postgres';
++
++/** Cross-worker serialization for one asset's metadata and file paths.
++ *
++ * The supplied pool is used only for locks. Holding a lock must not reserve a
++ * connection from the query pool: waiting jobs could otherwise exhaust the
++ * pool needed by the current lock holder. Transaction locks are released on
++ * success, failure, disconnect, and worker shutdown without manual unlocks.
++ */
++export class AssetMetadataLocks {
++  private readonly local = new AsyncLock({ maxPending: 10_000 });
++  private readonly held = new AsyncLocalStorage<ReadonlySet<string>>();
++
++  constructor(private readonly pool: Sql) {}
++
++  async run<T>(assetIds: string[], callback: () => Promise<T>): Promise<T> {
++    const ids = [...new Set(assetIds.map((id) => id.toLowerCase()))].sort();
++    if (ids.length === 0) {
++      return callback();
++    }
++
++    const held = this.held.getStore();
++    if (held) {
++      if (ids.every((id) => held.has(id))) {
++        return callback();
++      }
++      // Acquiring another asset while holding a lock can reverse the global
++      // order. Motion-photo extraction runs its child job after releasing the
++      // parent lock instead.
++      throw new Error('Nested metadata locks must be a subset of the held asset IDs');
++    }
++
++    return this.local.acquire(ids, async () => {
++      return (await this.pool.begin(async (transaction) => {
++        for (const id of ids) {
++          await transaction`SELECT pg_advisory_xact_lock(hashtextextended(${'immich:asset-metadata:' + id}, 0))`;
++        }
++        return this.held.run(new Set(ids), callback);
++      })) as T;
++    });
++  }
++
++  async close() {
++    await this.pool.end();
++  }
++}
+diff --git a/server/test/asset-metadata-lock.helper.ts b/server/test/asset-metadata-lock.helper.ts
+new file mode 100644
+index 0000000..e5cd804
+--- /dev/null
++++ b/server/test/asset-metadata-lock.helper.ts
+@@ -0,0 +1,46 @@
++import { createPostgres } from '@immich/sql-tools';
++import { Sql, TransactionSql } from 'postgres';
++import { AssetMetadataLocks } from 'src/utils/asset-metadata-lock';
++
++export const deferred = () => {
++  let resolve!: () => void;
++  const promise = new Promise<void>((done) => (resolve = done));
++  return { promise, resolve };
++};
++
++// A transactional lock backend for unit tests. Set KODA_TEST_DATABASE_URL to
++// exercise the exact same tests against independent real PostgreSQL sessions.
++export const lockHarness = () => {
++  const tails = new Map<string, Promise<void>>();
++  const locks: AssetMetadataLocks[] = [];
++  const create = () => {
++    const url = process.env.KODA_TEST_DATABASE_URL;
++    const pool = url
++      ? createPostgres({ connection: { connectionType: 'url', url }, maxConnections: 4 })
++      : ({
++          async begin(callback: (sql: TransactionSql) => Promise<unknown>) {
++            const release: (() => void)[] = [];
++            const transaction = async (_strings: TemplateStringsArray, key: string) => {
++              const before = tails.get(key) ?? Promise.resolve();
++              const after = deferred();
++              tails.set(key, after.promise);
++              await before;
++              release.push(after.resolve);
++              return [];
++            };
++            try {
++              return await callback(transaction as unknown as TransactionSql);
++            } finally {
++              for (const done of release.toReversed()) {
++                done();
++              }
++            }
++          },
++          async end() {},
++        } as unknown as Sql);
++    const lock = new AssetMetadataLocks(pool);
++    locks.push(lock);
++    return lock;
++  };
++  return { create, close: () => Promise.all(locks.map((lock) => lock.close())) };
++};
+diff --git a/server/test/utils.ts b/server/test/utils.ts
+index df7d175..2735eb9 100644
+--- a/server/test/utils.ts
++++ b/server/test/utils.ts
+@@ -309,6 +309,7 @@ export const getMocks = () => {
+   const databaseMock = automock(DatabaseRepository, { args: [, loggerMock], strict: false });
+ 
+   databaseMock.withLock.mockImplementation((_type, fn) => fn());
++  databaseMock.withAssetMetadataLock.mockImplementation((_ids, fn) => fn());
+   databaseMock.getPostgresVersion = vitest.fn().mockResolvedValue('14.10 (Debian 14.10-1.pgdg120+1)');
+   databaseMock.getPostgresVersionRange = vitest.fn().mockReturnValue('>=14.0.0');
+   databaseMock.createExtension = vitest.fn().mockResolvedValue(void 0);

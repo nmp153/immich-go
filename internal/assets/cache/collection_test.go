@@ -146,3 +146,22 @@ func TestCollectionCacheConcurrentAccess(t *testing.T) {
 	}
 	cc.Close()
 }
+
+func TestCollectionCacheRetainsEarlyAndFinalSaveErrors(t *testing.T) {
+	first, last := errors.New("early batch failed"), errors.New("final batch failed")
+	calls := 0
+	cc := NewCollectionCache[string](2, func(coll string, ids []string) (string, error) {
+		calls++
+		if calls == 1 {
+			return coll, first
+		}
+		return coll, last
+	})
+	for _, id := range []string{"a", "b", "c"} {
+		cc.AddIDToCollection("tag", "tag", id)
+	}
+	err := cc.Close()
+	if !errors.Is(err, first) || !errors.Is(err, last) {
+		t.Fatalf("save errors lost: %v", err)
+	}
+}
