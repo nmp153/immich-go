@@ -59,8 +59,10 @@ jobs:
           pnpm --filter immich build
       - name: Assemble candidate
         run: |
+          go test -race ./app/upload ./immich
           python3 koda-server/package.py /tmp/koda-immich /tmp/koda-server-fix
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -tags timetzdata -ldflags '-s -w -X github.com/simulot/immich-go/app.Version=0.32.0-koda.3' -o /tmp/koda-server-fix/immich-go-koda .
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -tags timetzdata -ldflags '-s -w -X github.com/simulot/immich-go/app.Version=0.32.0-koda.4' -o /tmp/koda-server-fix/immich-go-koda .
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -tags timetzdata -ldflags '-s -w -X github.com/simulot/immich-go/app.Version=0.32.0-koda.4' -o /tmp/koda-server-fix/mac-verifier/immich-go-koda .
       - name: Full isolated import verification with Storage Template enabled
         run: python3 /tmp/koda-server-fix/test-isolated.py --rounds 3
       - name: Save candidate and evidence

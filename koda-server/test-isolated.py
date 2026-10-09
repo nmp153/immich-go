@@ -43,6 +43,7 @@ def api(path, payload=None, token=None, method=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--rounds', type=int, default=3, choices=range(1,6))
+    parser.add_argument('--sudo', action='store_true', help='Run Docker through sudo; keep evidence owned by your login user')
     args = parser.parse_args()
     if not (PACKAGE / 'immich-go-koda').is_file():
         raise SystemExit('Missing the Linux test importer in this package.')
@@ -51,9 +52,10 @@ def main():
     project = 'koda-fix-test-' + token.lower()
     run = PACKAGE / 'test-results' / token
     run.mkdir(parents=True)
-    compose = ['docker', 'compose', '-p', project, '-f', str(PACKAGE / 'compose.test.yml')]
+    docker = ['sudo', 'docker'] if args.sudo else ['docker']
+    compose = docker + ['compose', '-p', project, '-f', str(PACKAGE / 'compose.test.yml')]
     result = {'result': 'FAIL', 'mode': 'isolated', 'productionModified': False, 'roundsRequested': args.rounds, 'rounds': []}
-    subprocess.run(['docker', 'info'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    subprocess.run(docker + ['info'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     # Port ownership is established by successfully starting our own uniquely
     # named Compose project before any signup, configuration, or test writes.
     started = False
@@ -62,7 +64,7 @@ def main():
         subprocess.run(compose + ['up', '-d', '--build', '--wait', '--wait-timeout', '180'], check=True)
         started = True
         container_id = subprocess.check_output(compose + ['ps', '-q', 'server'], text=True).strip()
-        inspect = json.loads(subprocess.check_output(['docker', 'inspect', container_id], text=True))[0]
+        inspect = json.loads(subprocess.check_output(docker + ['inspect', container_id], text=True))[0]
         if inspect['Config']['Labels'].get('com.docker.compose.project') != project:
             raise RuntimeError('Unexpected test container identity')
         if inspect['Config']['Labels'].get('com.mykodahome.koda.metadata-fix') != '1':

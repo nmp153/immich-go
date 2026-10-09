@@ -23,16 +23,22 @@ for name in files:
         dest = out / 'overlay' / (name + suffix)
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dest)
-for name in ['Dockerfile', 'compose.test.yml', 'test-isolated.py', 'server.patch', 'negative-control.py']:
+for name in ['Dockerfile', 'compose.test.yml', 'test-isolated.py', 'server.patch', 'negative-control.py', 'README.md', 'preflight.py']:
     shutil.copy2(root / 'koda-server' / name, out / name)
+shutil.copy2(server / 'LICENSE', out / 'LICENSE-Immich')
+shutil.copy2(root / 'LICENSE', out / 'LICENSE-immich-go')
 shutil.copy2(root / 'scripts/koda-validate.py', out / 'koda-validate.py')
 shutil.copytree(root / 'internal/e2e/client/DATA/fromGooglePhotos/edited-pair', out / 'synthetic-fixtures/edited-pair', dirs_exist_ok=True)
 shutil.copytree(root / 'internal/e2e/client/DATA/fromGooglePhotos/replaced-copy', out / 'synthetic-fixtures/replaced-copy', dirs_exist_ok=True)
+mac = out / 'mac-verifier'
+mac.mkdir(exist_ok=True)
+shutil.copy2(root / 'scripts/koda-validate.py', mac / 'koda-validate.py')
+shutil.copytree(out / 'synthetic-fixtures', mac / 'synthetic-fixtures', dirs_exist_ok=True)
 manifest = {
     'patchVersion': '3.2.4-koda.1',
     'upstreamVersion': '3.2.4',
     'upstreamCommit': 'db355f79d910bbfc6378117ed10868493c97b922',
-    'importerVersion': '0.32.0-koda.3',
+    'importerVersion': '0.32.0-koda.4',
     'storageTemplateRequired': True,
     'schemaChanges': False,
     'sourcePatchSHA256': hashlib.sha256((out / 'server.patch').read_bytes()).hexdigest(),

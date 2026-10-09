@@ -268,8 +268,8 @@ class Validation:
             raise RuntimeError("Wrong account. The key must belong to Koda Import Test, a non-admin user")
         self.save("account", {"id": who["id"], "name": who.get("name"), "isAdmin": who["isAdmin"]})
         version = subprocess.run([str(self.package / "immich-go-koda"), "--version"], capture_output=True, text=True)
-        if version.returncode or version.stdout.strip() != "immich-go version 0.32.0-koda.3":
-            raise RuntimeError("Expected candidate 3. Run ./immich-go-koda --version and allow it in macOS if prompted")
+        if version.returncode or version.stdout.strip() != "immich-go version 0.32.0-koda.4":
+            raise RuntimeError("Expected candidate 4. Run ./immich-go-koda --version and allow it in macOS if prompted")
         roots, manifest = make_fixtures(self.package / "synthetic-fixtures", self.run / "fixtures", self.run.name)
         self.save("fixture-manifest", manifest)
         self.save("build", {"version": version.stdout.strip(), "sha256": hashlib.sha256((self.package / "immich-go-koda").read_bytes()).hexdigest()})

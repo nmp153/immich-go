@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"path"
+	"regexp"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,8 @@ import (
 
 // - - go:generate stringer -type=AdviceCode
 type AdviceCode int
+
+var numberedTakeoutCopy = regexp.MustCompile(`^(.*)\([0-9]+\)(\.[^.]+)$`)
 
 func (a AdviceCode) String() string {
 	switch a {
@@ -294,6 +297,31 @@ func (ii *immichIndex) ShouldUpload(la *assets.Asset, upCmd *UpCmd, siblings ...
 	}
 
 	filename := path.Base(la.File.Name())
+	// Replacement history is only in memory. On a later import, Google may
+	// still supply the deleted smaller copy as X(1).jpg, with X.jpg as its title.
+	// Match it only to an explicitly present, larger original in this group
+	// whose bytes already exist on the server. Looking up the shared title alone
+	// could mistake X-edited.jpg for the original and discard a distinct photo.
+	if match := numberedTakeoutCopy.FindStringSubmatch(filename); !upCmd.Overwrite &&
+		match != nil && match[1]+match[2] == la.OriginalFileName && !la.CaptureDate.IsZero() {
+		for _, sibling := range siblings {
+			if sibling == la || path.Base(sibling.File.Name()) != la.OriginalFileName ||
+				sibling.OriginalFileName != la.OriginalFileName || sibling.FileSize <= la.FileSize ||
+				!sibling.CaptureDate.Equal(la.CaptureDate) {
+				continue
+			}
+			digest, err := sibling.GetChecksum()
+			if err != nil {
+				return nil, err
+			}
+			if existing, ok := ii.byChecksum.Load(digest); ok {
+				existing = ii.replacement(existing)
+				if !existing.Trashed && existing.FileSize > la.FileSize && existing.CaptureDate.Equal(la.CaptureDate) {
+					return ii.adviceBetterOnServer(existing), nil
+				}
+			}
+		}
+	}
 
 	// check all files with the same name
 	ids, ok := ii.byName.Load(filename)

@@ -251,3 +251,52 @@ func TestKodaEditedPairsAllOrders(t *testing.T) {
 		}
 	}
 }
+
+func TestKodaReplacementRepeatDoesNotResurrectNumberedCopy(t *testing.T) {
+	date := time.Date(2023, 11, 14, 22, 13, 20, 0, time.UTC)
+	for _, editedSize := range []int64{500, 5000} {
+		original := localAsset("X.jpg", "X.jpg", 2000, "sha-original", date)
+		edited := localAsset("X-edited.jpg", "X.jpg", editedSize, "sha-edited", date)
+		small := localAsset("X(1).jpg", "X.jpg", 1000, "sha-deleted-small", date)
+		index := newAssetIndex()
+		// A fresh process has no in-memory replacement history. Index the edited
+		// version first to ensure the shared sidecar title cannot select it.
+		index.add(serverAsset("edited", "X.jpg", editedSize, edited.Checksum, date), false)
+		index.add(serverAsset("original", "X.jpg", 2000, original.Checksum, date), false)
+		advice, err := index.ShouldUpload(small, &UpCmd{}, small, edited, original)
+		if err != nil || advice.Advice != BetterOnServer || advice.ServerAsset.ID != "original" {
+			t.Fatalf("edited size=%d: got %+v, %v; want the existing original", editedSize, advice, err)
+		}
+	}
+}
+
+func TestKodaNumberedCopyNeedsAnExistingLargerMatchingOriginal(t *testing.T) {
+	date := time.Date(2023, 11, 14, 22, 13, 20, 0, time.UTC)
+	for _, name := range []string{"missing original", "different date", "same size", "different title", "not numbered", "overwrite"} {
+		t.Run(name, func(t *testing.T) {
+			original := localAsset("X.jpg", "X.jpg", 2000, "sha-original", date)
+			small := localAsset("X(1).jpg", "X.jpg", 1000, "sha-small", date)
+			index := newAssetIndex()
+			command := &UpCmd{}
+			switch name {
+			case "different date":
+				original.CaptureDate = date.Add(time.Second)
+			case "same size":
+				original.FileSize = small.FileSize
+			case "different title":
+				small.OriginalFileName = "unrelated.jpg"
+			case "not numbered":
+				small.File = fshelper.FSName(nil, "X-edited.jpg")
+			case "overwrite":
+				command.Overwrite = true
+			}
+			if name != "missing original" {
+				index.add(serverAsset("original", "X.jpg", int64(original.FileSize), original.Checksum, original.CaptureDate), false)
+			}
+			advice, err := index.ShouldUpload(small, command, small, original)
+			if err != nil || advice.Advice != NotOnServer {
+				t.Fatalf("got %+v, %v; must preserve the distinct input", advice, err)
+			}
+		})
+	}
+}

@@ -1,10 +1,28 @@
-# Koda migration build — candidate 3
+# Koda migration build — candidate 4
 
 This is a temporary migration candidate, not an official immich-go release.
 Do not use it for a full library until synthetic and small real-data imports
 have passed against the target Immich version.
 
-## Current next step: diagnose with Storage Template ON
+## Current next step: verify the server patch with Storage Template ON
+
+The server-side candidate and its validation workflow are documented in
+[`koda-server/README.md`](koda-server/README.md). It coordinates metadata,
+sidecar writes, tag updates, and storage moves on Immich v3.2.4. No production
+server has been changed. Storage Template stays ON.
+
+The first full isolated run passed edited pairs, their repeat import, and the
+first larger-copy replacement. It exposed another client bug on the replacement
+repeat: the removed smaller `photo(1).jpg` was uploaded again. Candidate 4 uses
+the same group's larger original and its existing server checksum to prevent
+that repeat from resurrecting the smaller copy. Edited siblings stay distinct.
+Regression tests reproduce the failure before this change and pass afterward.
+
+The accompanying verifier now requires `0.32.0-koda.4`. Use the matching binary
+and verifier together. Full integration results and HP/WD verification remain
+separate gates before the real migration.
+
+## Historical candidate 3 diagnosis
 
 This supersedes the earlier recommendation to start with the storage-template
 workaround. The original server log confirms a missing XMP sidecar read during
