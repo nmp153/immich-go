@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """One bounded synthetic check for Koda candidate 3; never imports personal files.
 
-Uses only KODA_TEST_API_KEY and refuses any account except the established test
-user. It creates fresh fixture copies, performs real imports (including removal
+Uses KODA_TEST_API_KEY for API calls and refuses any account except the established
+test user. It creates fresh fixture copies, performs real imports (including removal
 of its own smaller replacement seed), and produces a redacted evidence ZIP.
 """
 import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import struct
 import subprocess
 import sys
@@ -23,6 +25,17 @@ SERVER = "https://photos.mykodahome.com"
 OWNER = "f2076ecf-6c00-4606-aa5d-1c91dedd4294"
 CAPTURE = "2023-11-14T22:13:20.000Z"
 LOCAL = "2023-11-14T17:13:20.000Z"
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def server_log_command(since, until, remote_path):
+    # Quote every argument even though these values are generated locally.
+    command = ["sudo", "docker", "logs", "--timestamps", "--since", since,
+               "--until", until, "immich_server"]
+    return "sudo -v && " + " ".join(shlex.quote(x) for x in command) + " > " + shlex.quote(remote_path) + " 2>&1"
 
 
 def checksum(data):
@@ -157,6 +170,7 @@ class Validation:
         self.package, self.key, self.run = package, key, run
         self.logs = run / "evidence"
         self.logs.mkdir(parents=True)
+        self.started_at = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat(timespec="seconds").replace("+00:00", "Z")
 
     def save(self, name, obj):
         text = json.dumps(obj, indent=2).replace(self.key, "[REDACTED]")
@@ -199,6 +213,12 @@ class Validation:
         while True:
             state = self.snapshot()
             self.save(name, state)
+            # Retain intermediate paths/tags/times instead of overwriting the
+            # only evidence of a transient metadata or file-move race.
+            observation = {"at": utc_now(), "stage": name,
+                           "assets": [dict(signature(a), updatedAt=a.get("updatedAt")) for a in state["assets"]]}
+            with (self.logs / "observations.jsonl").open("a") as output:
+                output.write(json.dumps(observation).replace(self.key, "[REDACTED]") + "\n")
             problems = audit(state, baseline, expected)
             if repeat is not None and not unchanged(repeat, state):
                 problems.append("repeat / refresh changed an asset, stack, or cover")
@@ -303,20 +323,45 @@ class Validation:
                            "timezone and tags", "metadata refresh durability", "downloaded original bytes"],
                 "next": "Review evidence, then a small real Takeout sample; full migration has not run"}
 
+    def collect_server_logs(self):
+        until = utc_now()
+        remote = "/home/nmp153/koda-diagnostic-" + self.run.name + ".log"
+        command = server_log_command(self.started_at, until, remote)
+        self.save("server-log-window", {"sinceUTC": self.started_at, "untilUTC": until,
+                                        "remoteFile": remote, "sshHost": "patel-homecloud"})
+        print("\nCollecting HP server logs. Enter the HP sudo password if prompted.", flush=True)
+        response = subprocess.run(["ssh", "-t", "-o", "ConnectTimeout=15", "patel-homecloud", command], timeout=180)
+        if response.returncode:
+            raise RuntimeError("HP server log export failed; local test evidence is still saved")
+        response = subprocess.run(["scp", "-o", "ConnectTimeout=15", "patel-homecloud:" + remote,
+                                   str(self.logs / "immich-server.log")], timeout=120)
+        if response.returncode:
+            raise RuntimeError("HP server log download failed; remote log remains at " + remote)
+        raw = (self.logs / "immich-server.log").read_bytes()
+        self.save("server-log-export", {"bytes": len(raw), "lines": len(raw.splitlines())})
+        if not raw.strip():
+            raise RuntimeError("Server log export was empty; test results alone cannot establish the server race")
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--storage-template-disabled", action="store_true",
-                        help="Acknowledge temporarily disabling Storage Template in Immich settings")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--storage-template-enabled", action="store_true",
+                      help="Record normal Storage Template ON; diagnose without changing upload behavior")
+    mode.add_argument("--storage-template-disabled", action="store_true",
+                      help="Record an explicit Storage Template OFF workaround test")
+    parser.add_argument("--collect-server-logs", action="store_true",
+                        help="Export the matching HP logs over SSH after the run (interactive sudo password may be required)")
     args = parser.parse_args()
-    if not args.storage_template_disabled:
-        parser.error("First turn off Enable Storage Template in Administration > Settings > Storage Template and save; then add --storage-template-disabled")
     key = os.environ.get("KODA_TEST_API_KEY", "").strip()
     if not key or "\n" in key or "\r" in key:
         parser.error("KODA_TEST_API_KEY is missing or malformed")
     package = Path(__file__).resolve().parent
     run = package / "validation-runs" / (time.strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8])
     task = Validation(package, key, run)
+    task.save("run-settings", {"storageTemplate": "on" if args.storage_template_enabled else "off",
+                               "settingSource": "operator-reported; this script does not change server settings",
+                               "collectServerLogs": args.collect_server_logs, "startedAtUTC": task.started_at})
     result = {"result": "FAIL"}
     try:
         result = task.execute()
@@ -325,6 +370,19 @@ def main():
         result["reason"] = str(error).replace(key, "[REDACTED]") or "Interrupted"
         print("STOP:", result["reason"], flush=True)
     finally:
+        if args.storage_template_enabled:
+            result["next"] = "Review this diagnostic trace; a PASS does not prove the intermittent server bug is fixed"
+        if args.collect_server_logs:
+            try:
+                task.collect_server_logs()
+                result["serverLogs"] = "collected"
+            except (Exception, KeyboardInterrupt) as error:
+                result["serverLogs"] = "not collected"
+                task.save("server-log-error", {"reason": str(error).replace(key, "[REDACTED]") or "Interrupted"})
+                result["testResult"] = result["result"]
+                result["result"] = "INCOMPLETE" if result["result"] == "PASS" else result["result"]
+                print("Server logs could not be collected; saving the client evidence anyway.", flush=True)
+        result["finishedAtUTC"] = utc_now()
         task.save("RESULT", result)
         for path in task.logs.iterdir():
             if path.is_file():

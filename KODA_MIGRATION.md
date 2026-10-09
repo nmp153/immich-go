@@ -4,6 +4,23 @@ This is a temporary migration candidate, not an official immich-go release.
 Do not use it for a full library until synthetic and small real-data imports
 have passed against the target Immich version.
 
+## Current next step: diagnose with Storage Template ON
+
+This supersedes the earlier recommendation to start with the storage-template
+workaround. The original server log confirms a missing XMP sidecar read during
+the initial edited-pair import. It does not identify every missing-tag failure
+or establish the exact order of concurrent operations. No server patch has
+been deployed, and the candidate 3 importer is not a fix for that server race.
+
+Use the storage-on diagnostic package and the instructions in
+`KODA_DIAGNOSTIC.md`. Its importer binary is the original candidate 3 binary;
+the updated Python runner supports explicitly recording Storage Template ON,
+retains intermediate snapshots, and optionally collects matching server logs
+over the existing `patel-homecloud` SSH connection. This is a diagnosis run,
+not a declaration that the migration is ready. Leave the storage template ON.
+
+The OFF workflow below is retained as a documented fallback only.
+
 ## Provenance
 
 - Base: v0.32.0, f7d19fce34acd4884ea2c02fc3025706a060afdf.
